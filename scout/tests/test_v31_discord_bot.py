@@ -251,6 +251,9 @@ def test_order_cards_carry_the_plan_and_the_running_result():
     assert "DEMAND_OB" in fields["Zone / trigger"] and "M1 engulfing reclaim" in fields["Zone / trigger"]
     assert "72/100" in fields["Confluence / scouts"] and "SUPPORTS 6/10" in fields["Confluence / scouts"]
     assert "COUPLED" in fields["Silver"]
+    rejected = order_card("order", {"side": "LONG", "success": False, "retcode": 10019,
+                                    "message": "Not enough money", "entry": 2500.5})
+    assert rejected["title"] == "🔴 ORDER REJECTED · LONG" and rejected["color"] == 0xD85A30
 
     for kind in ("pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close", "trade_closed"):
         card = order_card(kind, {"side": "LONG", "ticket": 55, "realized_pnl": 12.5, "remaining_volume": 0.005,

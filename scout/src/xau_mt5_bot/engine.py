@@ -825,7 +825,6 @@ class TradingEngine:
                                     "role": "SECONDARY_CONFIRMATION_ONLY"},
             "fakeout_risk": rel.get("fakeout_rate"), "remaining_session_minutes": round(remaining_minutes, 1),
             "atr": round(atr, 3),                                     # v3.3.0: zone distance on the Detected card
-
             "intermarket": intermarket,                                                                            # v3.1.0
         }
         if self.startup_cycle and decision.action.value in {"LONG", "SHORT"}:                                  # v2.0.0 item 7: never trade on the cold/reconnect cycle

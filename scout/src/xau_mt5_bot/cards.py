@@ -311,7 +311,9 @@ def order_card(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
               "pa_breakeven": "🔒 SL moved to break-even", "pa_tp2_lock": "💰 TP2 — 25% closed, SL locked at TP1",
               "pa_trail": "📈 Trailing stop moved", "pa_close": "🏁 Position closed", "trade_closed": "🏁 Trade closed"}
     if kind in {"order", "order_withheld"}:
-        return {"title": titles[kind], "color": colour if kind == "order" else AMBER,
+        rejected = kind == "order" and payload.get("success") is False
+        title = f"🔴 ORDER REJECTED · {side}" if rejected else titles[kind]
+        return {"title": title, "color": RED if rejected else (colour if kind == "order" else AMBER),
                 "description": str(payload.get("reason") or payload.get("message") or ""),
                 "fields": _fields(
                     ("Ticket / entry", f"#{payload.get('ticket', 'n/a')} @ {_f(payload.get('entry') or payload.get('price'))}", True),
