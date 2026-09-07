@@ -278,11 +278,69 @@ def test_no_module_reads_a_raw_mt5_epoch_outside_the_conversion_point():
     assert offenders == [], f"raw MT5 epoch conversions outside mt5_client.py: {offenders}"
 
 
-def test_mt5_client_applies_the_offset_to_ticks_bars_and_deal_history():
+def test_mt5_client_applies_the_offset_to_ticks_bars_and_deal_history(monkeypatch):
+    """Drive the REAL MT5Client against a mocked UTC+3 terminal: a source grep cannot prove the conversion."""
+    from test_mt5_adapter_contract import MockMT5
+    import xau_mt5_bot.mt5_client as adapter
+
+    fake = MockMT5(broker_offset_hours=3.0)
+    true_now = datetime.now(UTC).replace(microsecond=0)
+    fake.tick_epoch_utc = int(true_now.timestamp())        # the tick's TRUE UTC instant is now
+    monkeypatch.setattr(adapter, "mt5", fake)
+    client = adapter.MT5Client(symbol="XAUUSD")
+
+    validation = client.validate_terminal()
+    assert validation["broker_utc_offset_hours"] == 3.0                    # detected, not assumed
+    assert abs(validation["broker_clock_residual_seconds"]) < 5
+    assert validation["tick_age_seconds"] < 5                              # not the 10 800 s the raw stamp implies
+
+    # 1. the tick comes back as true UTC, not the broker's wall clock
+    assert fake.symbol_info_tick("XAUUSD").time == int(true_now.timestamp()) + 3 * 3600   # what MT5 actually reports
+    assert client.get_tick("XAUUSD").time == true_now
+
+    # 2. bar times are converted, and stay a correct bar grid
+    bars = client.get_bars("XAUUSD", "M5", 12)
+    assert len(bars) == 12
+    latest = pd.Timestamp(bars.iloc[-1]["time"]).to_pydatetime()
+    assert latest == true_now - timedelta(seconds=int(true_now.timestamp()) % 300)
+    assert latest <= true_now, "converted bars must not sit in the future"
+    assert bars.time.is_monotonic_increasing
+    assert (bars.time.diff().dropna() == pd.Timedelta(minutes=5)).all()
+
+    # 3. deal history is QUERIED in broker time and REPORTED in UTC
+    opened = true_now - timedelta(hours=2)
+    deals = client.closed_deals(77, opened)
+    start, end, _ = fake.history_window
+    assert start == opened - timedelta(days=1) + timedelta(hours=3)        # bounds shifted into broker time
+    assert end - start > timedelta(0)
+    assert deals[0]["time"] == datetime.fromtimestamp(int(end.timestamp()) - 1, tz=UTC) - timedelta(hours=3)
+
+    # 4. with no offset the same calls are identity — the conversion cannot skew a UTC broker
+    plain = MockMT5(broker_offset_hours=0.0)
+    plain.tick_epoch_utc = int(true_now.timestamp())
+    monkeypatch.setattr(adapter, "mt5", plain)
+    plain_client = adapter.MT5Client(symbol="XAUUSD")
+    plain_client.validate_terminal()
+    assert plain_client.broker_clock()["offset_hours"] == 0.0
+    assert plain_client.get_tick("XAUUSD").time == true_now
+
+
+def test_uncorrected_get_bars_would_return_future_timestamps(monkeypatch):
+    """The regression this guards: without the offset, MT5Client bars land 3 h in the future."""
+    from test_mt5_adapter_contract import MockMT5
+    import xau_mt5_bot.mt5_client as adapter
+
+    fake = MockMT5(broker_offset_hours=3.0)
+    true_now = datetime.now(UTC).replace(microsecond=0)
+    fake.tick_epoch_utc = int(true_now.timestamp())
+    monkeypatch.setattr(adapter, "mt5", fake)
+    client = adapter.MT5Client(symbol="XAUUSD")          # offset never measured → still 0
+    latest = pd.Timestamp(client.get_bars("XAUUSD", "M5", 6).iloc[-1]["time"]).to_pydatetime()
+    assert latest > true_now and (latest - true_now) >= timedelta(hours=2, minutes=55)
+
+
+def test_mt5_client_source_no_longer_claims_timestamps_are_utc():
     src = (ROOT / "src" / "xau_mt5_bot" / "mt5_client.py").read_text(encoding="utf-8")
-    assert "return Tick(self.clock.epoch_to_utc(value.time)" in src
-    assert 'frame["time"] = self.clock.frame_to_utc(' in src
-    assert "mt5.history_deals_get(self.clock.to_broker(start)" in src
     assert "never apply a broker-offset subtraction" not in src            # the v3.2.0 assumption is gone
 
 
