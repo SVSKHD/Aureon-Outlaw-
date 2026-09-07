@@ -284,3 +284,29 @@ def test_mt5_client_applies_the_offset_to_ticks_bars_and_deal_history():
     assert 'frame["time"] = self.clock.frame_to_utc(' in src
     assert "mt5.history_deals_get(self.clock.to_broker(start)" in src
     assert "never apply a broker-offset subtraction" not in src            # the v3.2.0 assumption is gone
+
+
+# --- the Firestore contract really carries what it claims -------------------------------------------------------------
+def test_firestore_summary_carries_the_offset_and_the_veto_list(config, tmp_path: Path):
+    import json as _json
+    from xau_mt5_bot.firestore_sink import FirestoreSink
+
+    config.project_dir = str(tmp_path)
+    client = _BrokerBarClient(broker_offset_hours=3.0)
+    client.tick = Tick(ASIA_NOW, 2500.00, 2500.20)
+    engine = TradingEngine(client, config, _CycleLogger())
+    snapshot = engine.run_cycle(ASIA_NOW)
+    engine.shutdown()
+
+    summary = FirestoreSink("missing")._summary(snapshot)
+    contract = _json.loads((ROOT / "FIRESTORE_SCHEMA.json").read_text(encoding="utf-8"))["collections"]["sessions"]
+    assert summary["schema_version"] == "3.3.0"
+    assert set(contract["price_required"]) <= set(summary["price"])
+    assert summary["price"]["broker_utc_offset_hours"] == 3.0
+    assert set(contract["analysis_required"]) <= set(summary["analysis"])
+    assert set(contract["broker_clock_fields"]) <= set(summary["analysis"]["broker_clock"])
+    for veto in summary["analysis"]["router_vetoes"]:
+        assert set(contract["veto_fields"]) <= set(veto)
+    order = [v["veto"] for v in summary["analysis"]["router_vetoes"]]
+    from xau_mt5_bot.decision_router import VETO_ORDER
+    assert tuple(order) == VETO_ORDER                                    # evaluation order, always the same

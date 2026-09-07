@@ -73,3 +73,19 @@ Review access requirements before production; do not make trading data publicly 
   smt (BULLISH|BEARISH|NONE), smt_timeframe, smt_detail {kind, xau[2], xag[2], timestamp}, relative_strength, silver_leading (UP|DOWN|NONE),
   long_points, short_points, reason}`. Evidence only; never a permission.
 - `events` gains `smt_divergence` and `intermarket_unavailable`.
+
+## 3.3.0 additions
+
+- `sessions/{date_SESSION}.price.broker_utc_offset_hours` — the broker server's UTC offset in hours (e.g. `3.0`),
+  detected at runtime and **already removed** from every timestamp in the document. MT5 reports tick and bar times in
+  broker-server time; the bot converts them once, in `mt5_client.BrokerClock`, so `updated_ts` and every analysis
+  timestamp are true UTC. `null` when no reading is available yet.
+- `sessions/{date_SESSION}.analysis.broker_clock` —
+  `{offset_hours, offset_seconds, residual_seconds, raw_delta_seconds, source (auto|manual|none), server, measured_at}`.
+  `residual_seconds` is the genuine clock skew left after the offset is removed; it is the only value the order guard
+  compares against `safety.max_clock_skew_seconds`.
+- `sessions/{date_SESSION}.analysis.router_vetoes` and `.blocked_by` — the router's veto ladder in evaluation order as
+  `{veto, active, detail, flips_when}`. `blocked_by` is the filtered, currently-active subset shown as "Blocked by" on
+  the status card and by `!why`. Reporting only; the router itself is unchanged.
+- `sessions/{date_SESSION}.analysis.atr` — M5 ATR, used to express zone distance on the Detected card.
+- `events` gains `broker_clock_offset` (one per detected offset change) and `broker_clock_error`.
