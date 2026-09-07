@@ -3,7 +3,8 @@
 ## Implemented
 
 - Modular MT5 client and native timeframe history
-- UTC timestamp handling with no broker-offset subtraction
+- Broker-server clock offset detected once per hour and removed at a single conversion point (`mt5_client.BrokerClock`),
+  so every tick, bar, deal and position timestamp downstream is true UTC; only the residual counts as clock skew
 - Forming/closed candle separation
 - DST-aware London/New York session boundaries
 - Hedging-only paired scouts, magic separation, verified close-before-open lifecycle
