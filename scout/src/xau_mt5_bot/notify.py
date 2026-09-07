@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import urllib.request
 import urllib.error
 from typing import Any
@@ -21,10 +23,11 @@ class Discord:
 
     def __init__(self, webhook_env: str, min_interval: int = 300, scout_pair_min_interval: int = 60,
                  retry_count: int = 3, retry_backoff_seconds: float = 1.0,
-                 status_mode: str = "events", event_level: str = "trade") -> None:
+                 status_mode: str = "hourly", event_level: str = "trade") -> None:
         self.status_mode, self.event_level = status_mode, event_level                         # v3.1.1
         self.url = os.environ.get(webhook_env, "") or os.environ.get("DISCORD_WEBHOOK_URL", "")     # v3.1.0: accept the common alias
         self.min_interval = min_interval
+        self._last_hour: str | None = None
         self._last_status = 0.0
         self._last_key: str | None = None
         self._last_detection_sig: str | None = None; self._last_detection_push = 0.0                 # v3.2.0
@@ -92,7 +95,13 @@ class Discord:
 
     def on_snapshot(self, s: AnalysisSnapshot, tz: str) -> None:
         """Send immediately when the decision/entry-state changes; otherwise at most one status per min_interval."""
+        if self.status_mode == "off":
+            return
         d = snapshot_dict(s); now = time.time()
+        hour = None
+        if self.status_mode == "hourly":
+            stamp = datetime.fromisoformat(str(d["timestamp"])).astimezone(ZoneInfo(tz))
+            hour = stamp.replace(minute=0, second=0, microsecond=0).isoformat()
         sig = detection_signature(d)                                                                # v3.2.0: detections card on new detection
         if self._last_detection_sig is not None and sig != self._last_detection_sig and now - self._last_detection_push >= 60 and self.status_mode != "off":
             if self.send(embed=detections_card(d, tz)):
@@ -101,9 +110,11 @@ class Discord:
         if self.status_mode == "events":
             return                                                                                   # v3.1.1: status only on request (!status)
         key = f"{s.decision.action.value}|{s.entry_state.value}|{s.pa_side}|{s.session.value}|{s.go_status}"
-        if key != self._last_key or (self.status_mode == "interval" and now - self._last_status >= self.min_interval):
+        scout = d.get("scout") or {}
+        key += f"|{scout.get('verdict')}|{bool(scout.get('buy_ticket') and scout.get('sell_ticket'))}"
+        if key != self._last_key or (self.status_mode == "hourly" and hour != self._last_hour) or (self.status_mode == "interval" and now - self._last_status >= self.min_interval):
             if self.send(embed=status_card(d, tz)):
-                self._last_key, self._last_status = key, now
+                self._last_key, self._last_status, self._last_hour = key, now, hour
 
     ELIGIBLE_EVENTS: frozenset = frozenset({"session_transition", "session_summary", "weekly_report", "next_week_open_report", "scout_session_stats",
                    "scout_session_open", "scout_session_close", "scout_rollback", "scout_repair", "scout_leg_repaired", "scout_adopted",

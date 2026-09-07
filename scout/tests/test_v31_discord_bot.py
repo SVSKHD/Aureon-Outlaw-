@@ -91,7 +91,9 @@ def test_discord_commands_answer_from_bot_files(tmp_path):
     engine.shutdown()
     state = BotState(tmp_path)
     status = dispatch(state, "!status")
-    assert isinstance(status, dict) and status["title"].split(" · ")[1] in {"LONG", "SHORT", "WAIT", "NO TRADE"} and "COUPLED" in status["fields"][2]["value"]
+    assert isinstance(status, dict) and "WAIT / NO MANUAL ENTRY" in status["title"]
+    fields = {f["name"]: f["value"] for f in status["fields"]}
+    assert "COUPLED" in fields["Silver"] and "UNAVAILABLE" in fields["Fakeout assessment"]
     text = dispatch(state, "!text")
     assert text.startswith("**[") and "Silver: COUPLED" in text
     det = dispatch(state, "!detected")
@@ -132,9 +134,9 @@ def test_user_and_channel_authorisation():
     assert authorised("any", "any", "", set())
 
 
-def test_quiet_discord_defaults_suppress_status_and_noise(monkeypatch):
+def test_explicit_events_mode_suppresses_status_and_noise(monkeypatch):
     from xau_mt5_bot.notify import Discord
-    d = Discord("NOPE", 0, 0); d.url = "https://example.invalid/hook"; sent = []
+    d = Discord("NOPE", 0, 0, status_mode="events"); d.url = "https://example.invalid/hook"; sent = []
     monkeypatch.setattr(d, "send", lambda text="", embed=None: sent.append(embed or text) or True)
     assert d.status_mode == "events" and d.event_level == "trade"
     assert d.event("cycle_slow", {}) is False and d.event("mt5_validated", {}) is False and d.event("clock_check", {}) is False

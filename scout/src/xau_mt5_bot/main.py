@@ -87,7 +87,9 @@ def cli() -> int:
         if eligible:
             discord_box.put(_discord_then_mark, kind, payload, event_id)
     logger.event = fanout
-    client = MT5Client(mt5_terminal_path(), config.safety.deal_history_max_days, symbol=config.symbol)
+    client = MT5Client(mt5_terminal_path(), config.safety.deal_history_max_days, symbol=config.symbol,
+                       tick_max_age_seconds=config.safety.broker_market_stale_seconds,
+                       broker_timestamp_offset_seconds=config.safety.broker_timestamp_offset_seconds)
     try:
         validation = client.initialize()                                            # attach to the logged-in terminal; no credentials
     except Exception as exc:

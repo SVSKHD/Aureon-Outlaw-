@@ -56,6 +56,7 @@ class SafetyConfig(BaseModel):
     one_pa_position_per_symbol: bool = True
     max_m1_age_seconds: int = Field(default=300, ge=60)
     retry_count: int = Field(default=1, ge=0, le=3)
+    broker_timestamp_offset_seconds: int = Field(default=0, ge=-50400, le=50400)
     max_clock_skew_seconds: int = Field(default=600, ge=60)
     transition_retry_limit: int = Field(default=5, ge=0)
     repair_missing_scout_leg: bool = True
@@ -146,7 +147,7 @@ class IntegrationsConfig(BaseModel):
     discord_min_interval_seconds: int = 300
     # v3.1.1 — status pushes: "events" = never push the status block (use !status), "changes" = only when the
     # decision/entry-state/PA side/session changes, "interval" = changes + one status every discord_min_interval_seconds.
-    discord_status_mode: str = Field(default="events", pattern="^(events|changes|interval)$")
+    discord_status_mode: str = Field(default="hourly", pattern="^(events|changes|interval|hourly|off)$")
     # v3.1.1 — event set: "trade" = lifecycle + risk events only; "all" = every eligible audit event (v3.0 behaviour).
     discord_event_level: str = Field(default="trade", pattern="^(trade|all)$")
     firebase_key_path: str = "serviceAccountKey.json"

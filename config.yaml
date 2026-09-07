@@ -19,8 +19,10 @@ risk:
   daily_max_loss_percent: 2.0
   max_consecutive_losses: 3
 safety:
+  # Keep 0 for standard UTC feeds. Set only after verifying broker timestamps and Windows UTC.
+  broker_timestamp_offset_seconds: 0
   allow_scout_orders: true      # session scout pairs on DEMO
-  allow_pa_orders: true         # PA trade on DEMO when the router says LONG/SHORT
+  allow_pa_orders: false         # manual entries; demo scouts still enabled
   allow_live_account: false     # hard stop: never a live account
   require_hedging_for_scouts: true
   one_pa_position_per_symbol: true
@@ -126,7 +128,7 @@ logging:
 integrations:
   discord_webhook_env: DISCORD_WEBHOOK
   discord_min_interval_seconds: 300
-  discord_status_mode: events   # events | changes | interval — status block only via !status by default (v3.1.1)
+  discord_status_mode: hourly   # hourly decision card + immediate decision changes
   discord_event_level: trade    # trade | all — session/scout/order/TP/close/error events only by default (v3.1.1)
   firebase_key_path: serviceAccountKey.json
   firestore_push_seconds: 300
