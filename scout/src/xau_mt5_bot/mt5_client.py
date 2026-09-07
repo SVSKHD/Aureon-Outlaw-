@@ -68,13 +68,14 @@ class MT5Client:
     TIMEFRAMES: dict[str, int] = {}
 
     def __init__(self, terminal_path: str | None = None, deal_history_max_days: int = 3650, symbol: str = "XAUUSD",
-                 tick_max_age_seconds: int = 120) -> None:
+                 tick_max_age_seconds: int = 120, broker_timestamp_offset_seconds: int = 0) -> None:
         if mt5 is None:
             raise RuntimeError("MetaTrader5 package is unavailable; run this bot on Windows with MT5")
         self.terminal_path = terminal_path or None
         self.deal_history_max_days = deal_history_max_days
         self.symbol = symbol
         self.tick_max_age_seconds = tick_max_age_seconds
+        self.broker_timestamp_offset_seconds = broker_timestamp_offset_seconds
         self.validation: dict[str, Any] = {}
         self.TIMEFRAMES = {
             "M1": mt5.TIMEFRAME_M1,
@@ -113,7 +114,10 @@ class MT5Client:
         info = mt5.symbol_info(self.symbol)
         tick = mt5.symbol_info_tick(self.symbol)
         if tick is None: raise RuntimeError(f"No tick for {self.symbol}: {mt5.last_error()}")
-        age = (datetime.now(UTC) - datetime.fromtimestamp(tick.time, tz=UTC)).total_seconds()
+        age = (datetime.now(UTC) - self.timestamp_utc(tick.time)).total_seconds()
+        if age < -5:
+            raise RuntimeError(f"{self.symbol} tick is {-age:.0f}s in the future; sync Windows clock first. "
+                               "Only for a verified non-UTC feed set safety.broker_timestamp_offset_seconds; do not widen the clock limit")
         if age > self.tick_max_age_seconds: raise RuntimeError(f"{self.symbol} tick is stale ({age:.0f}s old)")
         if float(info.volume_min) <= 0 or float(info.volume_step) <= 0 or float(info.volume_max) < float(info.volume_min):
             raise RuntimeError(f"Invalid volume constraints for {self.symbol}")
@@ -124,6 +128,7 @@ class MT5Client:
             "symbol": self.symbol, "symbol_visible": bool(info.visible), "tick_age_seconds": round(age, 1),
             "volume_min": float(info.volume_min), "volume_step": float(info.volume_step), "volume_max": float(info.volume_max),
             "terminal_path": self.terminal_path, "validated_at": datetime.now(UTC).isoformat(),
+            "broker_timestamp_offset_seconds": self.broker_timestamp_offset_seconds,
         }
         return self.validation
 
@@ -156,12 +161,16 @@ class MT5Client:
         self.ensure_symbol(symbol)
         return mt5.symbol_info(symbol)
 
+    def timestamp_utc(self, value: float) -> datetime:
+        """UTC by default. Explicit override only for a verified non-standard feed."""
+        return datetime.fromtimestamp(value - self.broker_timestamp_offset_seconds, tz=UTC)
+
     def get_tick(self, symbol: str) -> Tick:
         self.ensure_symbol(symbol)
         value = mt5.symbol_info_tick(symbol)
         if value is None:
             raise RuntimeError(f"No live tick for {symbol}: {mt5.last_error()}")
-        return Tick(datetime.fromtimestamp(value.time, tz=UTC), float(value.bid), float(value.ask))
+        return Tick(self.timestamp_utc(value.time), float(value.bid), float(value.ask))
 
     def get_bars(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
         self.ensure_symbol(symbol)
@@ -171,8 +180,8 @@ class MT5Client:
         if rates is None or len(rates) == 0:
             raise RuntimeError(f"No {timeframe} data for {symbol}: {mt5.last_error()}")
         frame = pd.DataFrame(rates)
-        # MT5 Unix timestamps are UTC instants; never apply a broker-offset subtraction.
-        frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+        # Standard MT5 is UTC; normalize only an explicitly configured non-standard feed.
+        frame["time"] = pd.to_datetime(frame["time"] - self.broker_timestamp_offset_seconds, unit="s", utc=True)
         return frame.sort_values("time").reset_index(drop=True)
 
     def account_state(self) -> AccountState:
@@ -194,6 +203,16 @@ class MT5Client:
     def positions(self, symbol: str | None = None, magic: int | None = None) -> list[Any]:
         values = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
         items = list(values or [])
+        if self.broker_timestamp_offset_seconds:
+            from types import SimpleNamespace
+            normalized = []
+            for position in items:
+                data = position._asdict() if hasattr(position, "_asdict") else vars(position).copy()
+                for key in ("time", "time_update", "time_msc", "time_update_msc"):
+                    if data.get(key):
+                        data[key] -= self.broker_timestamp_offset_seconds * (1000 if key.endswith("msc") else 1)
+                normalized.append(SimpleNamespace(**data))
+            items = normalized
         if magic is not None:
             items = [position for position in items if int(position.magic) == magic]
         return items
@@ -282,7 +301,7 @@ class MT5Client:
         reasons = {getattr(mt5, "DEAL_REASON_SL", 4): "SL", getattr(mt5, "DEAL_REASON_TP", 5): "TP", getattr(mt5, "DEAL_REASON_SO", 6): "STOP_OUT",
                    getattr(mt5, "DEAL_REASON_EXPERT", 3): "BOT", getattr(mt5, "DEAL_REASON_CLIENT", 0): "MANUAL"}
         return {"price": float(d.price), "profit": float(d.profit) + float(getattr(d, "commission", 0)) + float(getattr(d, "swap", 0)),
-                "time": datetime.fromtimestamp(int(d.time), tz=UTC), "reason": reasons.get(int(d.reason), str(d.reason)), "volume": float(d.volume)}
+                "time": self.timestamp_utc(d.time), "reason": reasons.get(int(d.reason), str(d.reason)), "volume": float(d.volume)}
 
     def closed_deals(self, position_ticket: int, opened_at: datetime | None = None) -> list[dict]:
         """All exit deals for a position, including partial exits and costs."""
@@ -301,7 +320,7 @@ class MT5Client:
             out.append({"deal_ticket": int(d.ticket), "price": float(d.price), "profit": float(d.profit),
                         "commission": float(getattr(d, "commission", 0)), "swap": float(getattr(d, "swap", 0)),
                         "net": float(d.profit) + float(getattr(d, "commission", 0)) + float(getattr(d, "swap", 0)),
-                        "time": datetime.fromtimestamp(int(d.time), tz=UTC), "reason": reasons.get(int(d.reason), str(d.reason)),
+                        "time": self.timestamp_utc(d.time), "reason": reasons.get(int(d.reason), str(d.reason)),
                         "volume": float(d.volume)})
         return out
 

@@ -26,11 +26,11 @@ xau-mt5-bot = "xau_mt5_bot.main:cli"
 xau-discord-bot = "xau_mt5_bot.discord_bot:main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["scout/src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
-testpaths = ["tests"]
+pythonpath = ["scout/src"]
+testpaths = ["scout/tests"]
 addopts = "-q"
 
 [tool.ruff]

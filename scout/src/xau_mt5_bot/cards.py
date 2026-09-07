@@ -61,6 +61,33 @@ def _fields(*pairs: tuple[str, str, bool]) -> list[dict[str, Any]]:
     return [{"name": n, "value": (v or "—")[:1024], "inline": i} for n, v, i in pairs]
 
 
+def fakeout_text(s: dict[str, Any]) -> str:
+    r = _g(s, "analysis", "historical_pattern_reliability", default={})
+    n = r.get("samples", 0)
+    rate = r.get("fakeout_rate")
+    if r.get("status") != "SUFFICIENT_SAMPLE" or not isinstance(rate, (int, float)) or not 0 <= rate <= 1:
+        return f"UNAVAILABLE - insufficient comparable history (n={n}). No invented score."
+    ci = r.get("confidence_interval_fakeout")
+    interval = f" · 95% interval {_f(ci[0] * 100, 1)}–{_f(ci[1] * 100, 1)}%" if isinstance(ci, (list, tuple)) and len(ci) == 2 else ""
+    return (f"Historical fakeout score {rate * 100:.1f}/100 · n={n}{interval}\n"
+            f"Comparison: {r.get('comparison_level', 'unknown')}. Historical frequency, not a current-trade probability.")
+
+
+def next_pattern_text(s: dict[str, Any]) -> str:
+    side = s.get("pa_side")
+    zones = [z for z in (s.get("zones") or []) if z.get("side") == side]
+    if side not in {"LONG", "SHORT"} or not zones:
+        return "No directional setup yet. Watch for a liquidity sweep/reclaim or a confirmed structure break and retest; wait for a valid zone."
+    zone = zones[0]
+    direction = "bullish" if side == "LONG" else "bearish"
+    invalidation = zone.get("low") if side == "LONG" else zone.get("high")
+    condition = "below" if side == "LONG" else "above"
+    return (f"Conditional scenario: {direction} reaction at {_f(zone.get('low'))}–{_f(zone.get('high'))} ({zone.get('kind')}). "
+            f"Then require a fresh M1/M5 {direction} trigger and scout support.\n"
+            f"M5 close {condition} {_f(invalidation)} invalidates this zone scenario. "
+            "This is what to watch next, not a prediction that it will occur.")
+
+
 def status_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
     """[GO] / [NO-GO] card: what the router decided and why, in one screen."""
     go = str(s.get("go_status", "NO-GO")); action = str(_g(s, "decision", "action", default="NO_TRADE"))
@@ -69,20 +96,32 @@ def status_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
     st = s.get("structures", {}); sc = s.get("scout", {}); im = _g(s, "analysis", "intermarket", default={})
     zone = (s.get("zones") or [None])[0]; plan = s.get("trade_plan") or {}
     tgt = _g(s, "analysis", "session_target", default={})
-    plan_text = "none"
+    ready = (go == "GO" and action in {"LONG", "SHORT"} and bool(plan)
+             and bool(sc.get("buy_ticket") and sc.get("sell_ticket")) and sc.get("verdict") == "CONFIRMS")
+    manual_action = f"{'BUY' if action == 'LONG' else 'SELL'} READY" if ready else "WAIT / NO MANUAL ENTRY"
+    colour = GREEN if ready else AMBER
+
+    plan_text = "UNAVAILABLE - no valid structural entry/SL/TP plan; do not enter."
     if plan:
-        tps = " / ".join(f"{_f(tp)} ({_f(rr)}R)" for tp, rr in zip(plan.get("take_profits") or [], plan.get("actual_rr") or []))
-        plan_text = f"{plan.get('side')} entry {_f(plan.get('entry'))} · SL {_f(plan.get('stop_loss'))}\nTP {tps or 'none'} · {plan.get('target_realism')}"
+        targets = "\n".join(f"TP{i + 1} {_f(tp)} · {_f((plan.get('actual_rr') or [])[i]) if i < len(plan.get('actual_rr') or []) else 'n/a'}R"
+                            for i, tp in enumerate(plan.get("take_profits") or []))
+        plan_text = (f"{'READY AT SNAPSHOT' if ready else 'WATCHLIST ONLY - NOT AN ENTRY'}\n"
+                     f"{plan.get('side')} entry {_f(plan.get('entry'))} · SL {_f(plan.get('stop_loss'))}\n"
+                     f"SL reason: {plan.get('sl_reason', 'structural invalidation')}\n{targets or 'No valid targets'}")
     return {
-        "title": f"{'🟢' if colour == GREEN else '🟠' if colour == AMBER else '⚪' if colour == GREY else '🔴'} {go} · {action} · {pa} {conf}/100",
-        "description": f"{s.get('session')} · {_t(s.get('timestamp'), tz)} · {_f(s.get('bid'))}/{_f(s.get('ask'))} spread {_f(s.get('spread'))} · data {s.get('freshness')}",
+        "title": f"{'🟢' if ready else '🟠'} {manual_action} · {s.get('symbol', 'XAUUSD')}",
+        "description": f"{s.get('session')} · {str(s.get('timestamp', ''))[:10]} {_t(s.get('timestamp'), tz)} {tz} · {_f(s.get('bid'))}/{_f(s.get('ask'))} spread {_f(s.get('spread'))} · data {s.get('freshness')}",
         "color": colour,
         "fields": _fields(
+            ("Router / confirmation", f"Signal {go} · {action} · PA {pa} confluence {conf}/100 (not a probability). Manual readiness also requires a complete confirming scout pair.", False),
             ("Structure", f"D1 {_g(st, 'D1', 'state')} · H4 {_g(st, 'H4', 'state')} · H1 {_g(st, 'H1', 'state')} · M15 {_g(st, 'M15', 'state')} · M5 {_g(st, 'M5', 'state')}", False),
-            ("Scouts", f"{sc.get('leader') or 'none'} · BUY {_f(sc.get('buy_pnl'))} / SELL {_f(sc.get('sell_pnl'))} · {sc.get('verdict')} {sc.get('strength')}/10 · pace {sc.get('market_speed')}", True),
+            ("Scouts", f"{'PAIR ACTIVE' if sc.get('buy_ticket') and sc.get('sell_ticket') else 'PAIR INCOMPLETE / NOT PLACED - NO CONFIRMATION'}\n{sc.get('leader') or 'none'} · BUY {_f(sc.get('buy_pnl'))} / SELL {_f(sc.get('sell_pnl'))} · {sc.get('verdict')} {sc.get('strength')}/10 · pace {sc.get('market_speed')}", True),
             ("Silver", f"{im.get('regime', 'n/a')} r={im.get('correlation')} · SMT {im.get('smt', 'NONE')} · leading {im.get('silver_leading', 'NONE')}", True),
             ("Entry", f"{f'{_f(zone.get('low'))}–{_f(zone.get('high'))} {zone.get('kind')}' if zone else 'no zone'} · {s.get('entry_state')} · trigger {'CONFIRMED' if _g(s, 'trigger', 'confirmed') else 'waiting'}", False),
-            ("Plan", plan_text, False),
+            ("Manual entry / SL / targets", plan_text, False),
+            ("Next pattern to watch", next_pattern_text(s), False),
+            ("Fakeout assessment", fakeout_text(s), False),
+            ("Validity", "Snapshot only. Recheck !status before entry; cancel on invalidation, stale data or a changed decision. TP/SL apply to this MT5 feed, not a cTrader quote.", False),
             ("$10 target", f"{tgt.get('target_verdict', 'n/a')} · {_f(_g(s, 'analysis', 'remaining_session_minutes'), 0)} min left", True),
             ("Why", str(_g(s, "decision", "reason", default="")), False),
         ),
@@ -130,8 +169,10 @@ def scout_card(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         hint = RETCODE_HINTS.get(int(retcode), "") if isinstance(retcode, (int, float)) or (isinstance(retcode, str) and retcode.isdigit()) else payload.get("hint", "")
         return {"title": f"🔴 SCOUTS NOT PLACED · {session}", "color": RED,
                 "fields": _fields(("Reason", str(payload.get("message") or payload.get("reason")), False),
-                                  ("Fix", hint or "See !events 10 for order_attempt retcodes", False),
-                                  ("Retry", "automatic on the next cycle" if payload.get("retryable", True) else "no — needs a config/account change", True))}
+                                  ("Fix", hint or ("Sync Windows Date & time first. Compare current UTC with raw MT5 tick/bar times. Standard MT5 is UTC; only a verified non-UTC feed needs safety.broker_timestamp_offset_seconds. Never increase the skew limit to bypass this."
+                                   if any(word in str(payload.get("message") or payload.get("reason")).lower() for word in ("clock", "utc", "future"))
+                                   else "See !events 10 for order_attempt retcodes"), False),
+                                  ("Retry", "automatic with backoff (up to 5 minutes), while this session is current" if payload.get("retryable", True) else "no — needs a config/account change", True))}
     if kind == "scout_session_open":
         return {"title": f"🟢 SCOUTS PLACED · {session}", "color": GREEN,
                 "description": f"BUY + SELL {payload.get('lot', '')} lot · magic {payload.get('magic')} · session open {payload.get('open_price', '')}"}
