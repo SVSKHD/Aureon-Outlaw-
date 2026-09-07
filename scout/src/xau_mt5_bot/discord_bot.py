@@ -1,4 +1,4 @@
-"""Read-only Discord command bot (v3.1.0).
+"""Read-only Discord command bot (v3.3.0).
 
 Runs as a SEPARATE process next to the trading bot and answers `!commands` from the bot's own files:
 
@@ -13,7 +13,7 @@ authorisation point; there is deliberately no `!buy` / `!close`.
 Env: DISCORD_BOT_TOKEN (required), DISCORD_COMMAND_CHANNEL_ID or DISCORD_CHANNEL_ID (optional: answer only there),
      DISCORD_ALLOWED_USER_IDS (optional, comma-separated: answer only these users), DISCORD_COMMAND_PREFIX (default "!").
 
-Commands: !status !detected !text !plan !silver !scouts !positions !day !trades [n] !go !events [n] !heartbeat !reports [n] !help
+Commands: !status !why !clock !detected !text !plan !silver !scouts !positions !day !trades [n] !go !events [n] !heartbeat !reports [n] !help
 """
 from __future__ import annotations
 
@@ -21,17 +21,18 @@ import json
 import os
 import sqlite3
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import yaml
 
-from .cards import detections_card, status_card
+from .cards import blocked_by_text, detections_card, status_card, why_text
 
 HELP = (
-    "`!status` GO/NO-GO card · `!detected` patterns/structure/sweeps/zones card · `!text` old status block · `!plan` entry/SL/TP/RR · `!silver` XAU/XAG correlation + SMT · `!scouts` session pair\n"
+    "`!status` GO/NO-GO card · `!why` what is blocking a trade and what would flip it · `!clock` broker vs system time\n"
+    "`!detected` patterns/structure/sweeps/zones card · `!text` old status block · `!plan` entry/SL/TP/RR · `!silver` XAU/XAG correlation + SMT · `!scouts` session pair\n"
     "`!positions` open PA trades · `!day` realised P/L and locks · `!trades [n]` last closed trades · `!go` session GO tallies\n"
     "`!events [n]` last audit events · `!reports [n]` session/weekly reports · `!heartbeat` process health · `!help`\n"
     "Read-only. Demo bot. No order commands exist."
@@ -169,6 +170,7 @@ def fmt_status(state: BotState) -> str:
         f"Scouts: leader {sc.get('leader')} · BUY {_f(sc.get('buy_pnl'))} · SELL {_f(sc.get('sell_pnl'))} · {sc.get('verdict')} {sc.get('strength')}/10 · pace {sc.get('market_speed')}",
         f"Silver: {im.get('regime', 'n/a')} r={im.get('correlation')} · SMT {im.get('smt', 'NONE')} · leading {im.get('silver_leading', 'NONE')} · +{im.get('long_points', 0)}L/+{im.get('short_points', 0)}S",
         f"Entry: {_zone_text(zone)} · {s.get('entry_state')} · trigger {'CONFIRMED' if _get(s, 'trigger', 'confirmed') else 'waiting'} — {_get(s, 'trigger', 'reason')}",
+        f"Blocked by: {blocked_by_text(s)}",
         f"Reason: {_get(s, 'decision', 'reason')}",
     ]
     return "\n".join(lines)
@@ -323,6 +325,38 @@ def fmt_heartbeat(state: BotState) -> str:
     ])
 
 
+def fmt_why(state: BotState) -> str:
+    """v3.3.0: every router veto currently blocking a trade, and what would flip each one."""
+    s = state.latest_snapshot()
+    if not s:
+        return "No snapshot yet."
+    header = f"**[{s.get('go_status')}] [{_get(s, 'decision', 'action')}]** {state.local(s.get('timestamp'))} · {s.get('session')}"
+    return f"{header}\n{why_text(s)}\nRouter reason: {_get(s, 'decision', 'reason')}"
+
+
+def fmt_clock(state: BotState) -> str:
+    """v3.3.0: system UTC, broker time, detected offset, residual skew and whether the order guard is open."""
+    s = state.latest_snapshot() or {}
+    hb = state.heartbeat() or {}
+    clock = _get(s, "analysis", "broker_clock", default=None) or hb.get("broker_clock") or {}
+    if not clock:
+        return "No broker clock reading yet — the trading bot has not completed a cycle."
+    now = datetime.now(UTC)
+    offset = float(clock.get("offset_hours") or 0.0)
+    residual = clock.get("residual_seconds")
+    limit = _get(s, "analysis", "blocked_by", default=None)
+    guard = "BLOCKED" if any(i.get("veto") == "clock" for i in (limit or [])) else "OPEN"
+    broker_now = now + timedelta(hours=offset)
+    return "\n".join([
+        f"**Broker clock** · guard {guard}",
+        f"System UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}Z",
+        f"Broker server time: {broker_now.strftime('%Y-%m-%d %H:%M:%S')} (UTC{offset:+g}) · server {clock.get('server') or 'n/a'}",
+        f"Detected offset: UTC{offset:+g} ({clock.get('source', 'auto')}) · measured {state.local(clock.get('measured_at'))}",
+        f"Residual skew after removing the offset: {residual}s · raw tick-vs-system delta {clock.get('raw_delta_seconds')}s",
+        "MT5 reports tick and bar times in broker-server time; the bot converts them to UTC and only the residual counts as skew.",
+    ])
+
+
 def _age_seconds(iso: str | None) -> float | None:
     try:
         return (datetime.now(UTC) - datetime.fromisoformat(iso)).total_seconds()
@@ -352,6 +386,8 @@ def dispatch(state: BotState, text: str, prefix: str = "!") -> str | dict[str, A
         if cmd in {"detected", "patterns", "seen"}:
             snap = state.latest_snapshot()
             return detections_card(snap, str(state.tz)) if snap else "No snapshot yet."
+        if cmd in {"why", "blocked"}: return fmt_why(state)
+        if cmd in {"clock", "time"}: return fmt_clock(state)
         if cmd == "text": return fmt_status(state)
         if cmd == "plan": return fmt_plan(state)
         if cmd in {"silver", "xag", "smt"}: return fmt_silver(state)

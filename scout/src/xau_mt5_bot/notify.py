@@ -115,7 +115,8 @@ class Discord:
                    "order_withheld", "state_file_recovered", "research_translation", "session_transition_delayed", "session_summary_recovered",
                    "pending_report_dropped", "startup_failed", "mt5_validated", "setup_outcome_resolved", "strong_scout_contradiction",
                    "scout_pending_stats_dropped", "shutdown_discord_pending",
-                   "smt_divergence", "intermarket_unavailable", "scout_open_failed"})                                                    # v3.1.0
+                   "smt_divergence", "intermarket_unavailable", "scout_open_failed",
+                   "broker_clock_offset", "broker_clock_error", "scout_leg_rolled_back"})     # v3.3.0                                                    # v3.1.0
 
     def is_eligible(self, kind: str) -> bool:
         if kind not in self.ELIGIBLE_EVENTS:
@@ -168,6 +169,9 @@ class Discord:
         elif kind == "session_summary_recovered":
             return self.send(f"**RECOVERY** · {payload.get('count')} session summary(ies) recovered after restart")
         elif kind == "mt5_validated":
-            return self.send(f"**MT5 ATTACHED** · account {payload.get('login')}@{payload.get('server')} · demo={payload.get('is_demo')} hedging={payload.get('is_hedging')} · algo={payload.get('algo_trading')} · tick age {payload.get('tick_age_seconds')}s")
+            offset = payload.get("broker_utc_offset_hours")
+            clock_text = (f" · broker clock UTC{offset:+g} ({payload.get('broker_clock_source', 'auto')}), residual skew "
+                          f"{payload.get('broker_clock_residual_seconds')}s") if offset is not None else ""
+            return self.send(f"**MT5 ATTACHED** · account {payload.get('login')}@{payload.get('server')} · demo={payload.get('is_demo')} hedging={payload.get('is_hedging')} · algo={payload.get('algo_trading')} · tick age {payload.get('tick_age_seconds')}s{clock_text}")
         else:
             return self.send(embed=event_card(kind, payload))
