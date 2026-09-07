@@ -9,9 +9,9 @@ import pandas as pd
 from .candles import detect_candlestick_patterns
 from .charts import detect_chart_patterns
 from .config import BotConfig
-from .decision_router import final_decision_router
+from .decision_router import blocked_by, final_decision_router, router_vetoes
 from .context import premium_discount, session_vwap, trendlines
-from .execution import account_is_safe, execute_pa_trade
+from .execution import account_is_safe, estimate_pair_margin, execute_pa_trade
 from .position_manager import PositionManager
 from .liquidity import is_neutral
 from .features import closed_bars, freshness_age_seconds, with_candle_features
@@ -71,6 +71,8 @@ class TradingEngine:
         self.pending_boundaries: list[tuple[SessionBoundary, int]] = []
         self._boundary_retry_after: dict[str, datetime] = {}
         self.clock_ok = True; self.clock_skew = 0.0
+        self.broker_clock: dict[str, Any] = {}                    # v3.3.0: detected broker timezone offset + residual skew
+        self._last_offset_reported: float | None = None
         self.last_trigger = None; self.last_trigger_time = None
         self.active_setup_id: str | None = None
         self.account_key = ""
@@ -103,7 +105,10 @@ class TradingEngine:
     def orders_allowed(self) -> tuple[bool, str]:
         """Gate for every order: broker clock sane, market open, account safe, tick fresh."""
         if not self.clock_ok:
-            return False, f"broker clock skew {self.clock_skew:.0f}s > {self.config.safety.max_clock_skew_seconds}s"
+            offset = self.broker_clock.get("offset_hours")
+            detail = f" (broker offset {offset:+g}h already removed)" if offset else ""
+            return False, (f"broker clock skew {self.clock_skew:.0f}s > "
+                           f"{self.config.safety.max_clock_skew_seconds}s{detail}")
         now = getattr(self, "cycle_now", None) or datetime.now(UTC)
         if not self.sessions.calendar_open(now):
             return False, "market closed by weekend/holiday/early-close calendar"
@@ -357,13 +362,42 @@ class TradingEngine:
             self._finalizing = False
 
     def _validate_clock(self, now: datetime) -> None:
-        tick = self.client.get_tick(self.config.symbol)
-        self.clock_skew = (tick.time - now).total_seconds()
+        """v3.3.0: the broker TIMEZONE offset is removed by the client first; only what is left over is skew.
+
+        Before v3.3.0 this compared a broker-server tick stamp with system UTC, so any broker that is not on
+        UTC (a UTC+3 server → 10 800 s) blocked every scout and PA order forever."""
+        info = self._broker_clock_info(now)
+        self.broker_clock = info
+        self.clock_skew = float(info.get("residual_seconds", 0.0))
         ok = abs(self.clock_skew) <= self.config.safety.max_clock_skew_seconds or not self.sessions.calendar_open(now)
+        offset_hours = float(info.get("offset_hours", 0.0))
+        if self._last_offset_reported != offset_hours or self.last_cycle is None:
+            self.logger.event("broker_clock_offset", {
+                "offset_hours": offset_hours, "residual_skew_seconds": round(self.clock_skew, 1),
+                "raw_delta_seconds": info.get("raw_delta_seconds"), "source": info.get("source"),
+                "server": info.get("server"), "max_clock_skew_seconds": self.config.safety.max_clock_skew_seconds,
+                "message": (f"Broker server clock is UTC{offset_hours:+g}; all MT5 tick and bar times are converted to UTC. "
+                            f"Residual skew {self.clock_skew:.0f}s."),
+            })
+            self._last_offset_reported = offset_hours
         if ok != self.clock_ok or self.last_cycle is None:
             self.logger.event("clock_check", {"tick_minus_system_seconds": round(self.clock_skew, 1), "ok": ok,
-                                              "message": "ok" if ok else "MT5 tick time far from system UTC — orders blocked; check broker timestamps / PC clock"})
+                                              "broker_utc_offset_hours": offset_hours,
+                                              "message": "ok" if ok else "MT5 tick time far from system UTC after removing the broker timezone offset — orders blocked; check the PC clock"})
         self.clock_ok = ok
+
+    def _broker_clock_info(self, now: datetime) -> dict[str, Any]:
+        """Single conversion point: ask the client. Clients without the v3.3.0 API fall back to raw tick-vs-UTC."""
+        refresh = getattr(self.client, "refresh_broker_offset", None)
+        if callable(refresh):
+            try:
+                return dict(refresh(now=now) or {})
+            except Exception as exc:
+                self.logger.event("broker_clock_error", {"error": str(exc)})
+        tick = self.client.get_tick(self.config.symbol)
+        delta = (tick.time - now).total_seconds()
+        return {"offset_hours": 0.0, "offset_seconds": 0.0, "residual_seconds": round(delta, 1),
+                "raw_delta_seconds": round(delta, 1), "source": "none", "server": "", "measured_at": None}
 
     def _handle_sessions(self, now: datetime) -> None:
         self.session_boundary_event = False
@@ -412,7 +446,8 @@ class TradingEngine:
             self.logger.event("session_transition", {"session": boundary.session.value, "kind": boundary.kind, "attempt": attempts + 1,
                                                      "success": result.success, "message": result.message})
             if boundary.kind == "START" and not result.success:
-                self._report_scout_failure(boundary.session, result, attempts + 1)
+                planned_retry = (now + timedelta(seconds=min(300, 5 * (2 ** min(attempts, 6))))) if result.retryable else None
+                self._report_scout_failure(boundary.session, result, attempts + 1, planned_retry)
             old_positions_remain = ended_session != SessionName.CLOSED and bool(
                 self.client.positions(self.config.symbol, self.scouts.magic(ended_session)))
             ended = ended_session != SessionName.CLOSED and not old_positions_remain and (boundary.kind == "CLOSE" or boundary.session != ended_session)
@@ -728,17 +763,17 @@ class TradingEngine:
             ok_setup, why_setup = self.positions.setup_allowed(setup_id or "unknown", now)                        # item 16
             if not ok_day or not ok_setup:
                 account_safe, safe_reason = False, why_day if not ok_day else why_setup
-        decision = final_decision_router(
-            DecisionInput(
-                pa_side, bool(selected), entry_state, trigger, scout, freshness, spread_state,
-                account_safe, plan.actual_rr[0] if plan and plan.actual_rr else None,
-                self.config.risk.min_actual_rr, plan.target_realism if plan else None,
-                confluence, self.config.analysis.min_confluence, setup_id,
-                self.config.scout_analysis.strong_contradiction_strength,
-                self.config.scout_analysis.hold_when_slow and
-                (scout.pace_calibrated or self.config.scout_analysis.hold_before_calibrated),
-            ), now,
+        decision_input = DecisionInput(
+            pa_side, bool(selected), entry_state, trigger, scout, freshness, spread_state,
+            account_safe, plan.actual_rr[0] if plan and plan.actual_rr else None,
+            self.config.risk.min_actual_rr, plan.target_realism if plan else None,
+            confluence, self.config.analysis.min_confluence, setup_id,
+            self.config.scout_analysis.strong_contradiction_strength,
+            self.config.scout_analysis.hold_when_slow and
+            (scout.pace_calibrated or self.config.scout_analysis.hold_before_calibrated),
         )
+        decision = final_decision_router(decision_input, now)
+        self._decision_input = decision_input                          # v3.3.0: reused for the "Blocked by" list
         snapshot = AnalysisSnapshot(
             now, self.config.symbol, self.sessions.session_at(now), tick.bid, tick.ask, spread,
             freshness, structures, patterns, liquidity, sweeps, selected_zones, pa_side,
@@ -773,7 +808,7 @@ class TradingEngine:
                 and decision.action.value in {"LONG", "SHORT"}):
             decision = Decision(Action.NO_TRADE, f"${self.config.session_target.target_price_move:.0f} session move UNLIKELY: {target.get('target_reason')}", now)
             snapshot.decision = decision
-            self.logger.event("order_withheld", {"reason": "session target unlikely", "setup_id": setup_id, "target": target})
+            self.logger.event("order_withheld", {**self._withheld_context(plan, selected, trigger, confluence, scout, snapshot), "reason": "session target unlikely", "setup_id": setup_id, "target": target})
         if self.config.session_target.enabled and mtf["label"] == "HIGHER_TF_CONFLICT" and decision.action.value in {"LONG", "SHORT"} \
                 and target.get("target_verdict") == "STRETCHED":
             decision = Decision(Action.WAIT, "Higher-timeframe conflict with a STRETCHED session target; waiting for alignment", now)
@@ -789,12 +824,14 @@ class TradingEngine:
                                     "buy_pnl": scout.buy_pnl, "sell_pnl": scout.sell_pnl, "market_speed": scout.market_speed,
                                     "role": "SECONDARY_CONFIRMATION_ONLY"},
             "fakeout_risk": rel.get("fakeout_rate"), "remaining_session_minutes": round(remaining_minutes, 1),
+            "atr": round(atr, 3),                                     # v3.3.0: zone distance on the Detected card
+
             "intermarket": intermarket,                                                                            # v3.1.0
         }
         if self.startup_cycle and decision.action.value in {"LONG", "SHORT"}:                                  # v2.0.0 item 7: never trade on the cold/reconnect cycle
             decision = Decision(Action.NO_TRADE, "Cold start: inputs captured before the synchronous history/pattern load; re-evaluating next cycle", now)
             snapshot.decision = decision
-            self.logger.event("order_withheld", {"reason": "cold start cycle", "setup_id": setup_id})
+            self.logger.event("order_withheld", {**self._withheld_context(plan, selected, trigger, confluence, scout, snapshot), "reason": "cold start cycle", "setup_id": setup_id})
         if plan is not None and decision.action.value in {"LONG", "SHORT"}:
             recheck_ok, recheck_why = self.orders_allowed()                                                   # v2.0.0 item 2: lock re-evaluated at send time
             if recheck_ok:
@@ -803,10 +840,21 @@ class TradingEngine:
             if not recheck_ok:
                 decision = Decision(Action.NO_TRADE, f"Order withheld at send: {recheck_why}", now)
                 snapshot.decision = decision
-                self.logger.event("order_withheld", {"reason": recheck_why, "setup_id": setup_id})
+                self.logger.event("order_withheld", {**self._withheld_context(plan, selected, trigger, confluence, scout, snapshot), "reason": recheck_why, "setup_id": setup_id})
         if plan is not None and decision.action.value in {"LONG", "SHORT"}:
             result = execute_pa_trade(self.client, self.config, decision, plan, self.logger.event)            # 9-13. sizing, order_check, retry, verify
             self.logger.order("PA", result, {"decision": decision, "plan": plan, "result": result, "setup_id": setup_id})
+            self.logger.event("order", {                                                          # v3.3.0: the whole trade on one card
+                "side": decision.action.value, "ticket": result.ticket, "success": result.success, "retcode": result.retcode,
+                "message": result.message, "session": snapshot.session.value, "setup_id": setup_id,
+                "entry": round(result.price if result.price else plan.entry, 2), "stop_loss": round(plan.stop_loss, 2),
+                "take_profits": [round(x, 2) for x in plan.take_profits], "actual_rr": plan.actual_rr,
+                "volume": result.volume_filled or None, "risk_currency": self._plan_risk_currency(plan, result),
+                "zone_kind": getattr(selected, "kind", None), "trigger_reason": trigger.reason,
+                "confluence": int(confluence), "scout_verdict": scout.verdict.value, "scout_strength": int(scout.strength),
+                "scout_leader": scout.leader,
+                "silver": f"{intermarket.get('regime', 'n/a')} r={intermarket.get('correlation')} · SMT {intermarket.get('smt', 'NONE')}",
+            })
             if result.success:
                 from dataclasses import asdict
                 for p in self.client.positions(self.config.symbol, self.config.magic.pa):
@@ -836,6 +884,22 @@ class TradingEngine:
             if getattr(self, "_last_contradiction_key", None) != key:
                 self._last_contradiction_key = key
                 self.logger.event("strong_scout_contradiction", {"pa_side": pa_side.value, "leader": scout.leader, "strength": scout.strength, "session": snapshot.session.value})
+        try:
+            day_ok, day_reason = self.positions.risk_allowed(self.cycle_tdate.isoformat(), self.client.account_state().balance)
+        except Exception as exc:                                               # never let the explanation break a cycle
+            day_ok, day_reason = True, f"day-lock state unavailable: {exc}"
+        gate = {
+            "clock_ok": self.clock_ok,
+            "clock_detail": (f"residual skew {self.clock_skew:.0f}s > {self.config.safety.max_clock_skew_seconds}s "
+                             f"(broker offset {self.broker_clock.get('offset_hours', 0):+g}h already removed)"),
+            "day_lock": not day_ok, "day_lock_detail": day_reason,
+            "spread": round(snapshot.spread, 3), "max_spread": self.config.risk.max_spread_price,
+            "remaining_minutes": remaining_minutes,
+            "minimum_remaining_minutes": self.config.session_target.minimum_remaining_minutes if self.config.session_target.enabled else None,
+        }
+        snapshot.analysis["router_vetoes"] = router_vetoes(self._decision_input, gate)
+        snapshot.analysis["blocked_by"] = blocked_by(self._decision_input, gate)
+        snapshot.analysis["broker_clock"] = dict(self.broker_clock)
         snapshot.analysis["decision_summary"] = {
             "signal_go": snapshot.go_status, "trade_action": snapshot.decision.action.value, "scout_verdict": scout.verdict.value,
             "target_verdict": target_block.get("target_verdict", "DISABLED"), "calibration_status": calibration_status,
@@ -1011,17 +1075,62 @@ class TradingEngine:
         starts = [e.timestamp for e in events if e.kind == "START" and e.session == current and e.timestamp <= now]
         return max(starts) if starts else None
 
-    def _report_scout_failure(self, session, result, attempt: int = 1) -> None:
-        """v3.2.0: one explicit, card-worthy event per failed scout placement (retcode parsed from the message)."""
+    @staticmethod
+    def _plan_risk_currency(plan, result) -> float | None:
+        """Rough currency risk of the filled volume at the plan's stop distance (reporting only)."""
+        try:
+            return round(abs(plan.entry - plan.stop_loss) * float(result.volume_filled or 0) * 100.0, 2) or None
+        except (TypeError, ValueError):
+            return None
+
+    def _withheld_context(self, plan, selected, trigger, confluence, scout, snapshot) -> dict[str, Any]:
+        """Everything an ORDER WITHHELD card needs to be self-explanatory (v3.3.0)."""
+        return {"side": snapshot.decision.action.value if snapshot.decision else None,
+                "session": snapshot.session.value,
+                "entry": round(plan.entry, 2) if plan is not None else None,
+                "stop_loss": round(plan.stop_loss, 2) if plan is not None else None,
+                "take_profits": [round(x, 2) for x in plan.take_profits] if plan is not None else [],
+                "actual_rr": plan.actual_rr if plan is not None else [],
+                "zone_kind": getattr(selected, "kind", None), "trigger_reason": trigger.reason,
+                "confluence": int(confluence), "scout_verdict": scout.verdict.value,
+                "scout_strength": int(scout.strength), "scout_leader": scout.leader}
+
+    def _report_scout_failure(self, session, result, attempt: int = 1, next_retry: datetime | None = None) -> None:
+        """v3.3.0: one card-worthy event per failed scout placement, carrying everything needed to act on it —
+        the detected broker offset and residual skew, the live spread, free vs required margin, and the next retry."""
         import re
         match = re.search(r"\b(10\d{3})\b", result.message or "")
         retcode = int(match.group(1)) if match else None
+        self.scouts.failed_attempts[session.value] = attempt
         key = f"{session.value}:{result.message}"
         if self._last_scout_failure_key == key and attempt > 1:
             return                                                                    # same failure repeating on retries — one card
         self._last_scout_failure_key = key
-        self.logger.event("scout_open_failed", {"session": session.value, "message": result.message, "retcode": retcode,
-                                                "retryable": result.retryable, "attempt": attempt})
+        payload = {"session": session.value, "message": result.message, "retcode": retcode,
+                   "retryable": result.retryable, "attempt": attempt,
+                   "broker_utc_offset_hours": self.broker_clock.get("offset_hours"),
+                   "broker_clock_source": self.broker_clock.get("source"),
+                   "broker_clock_residual_seconds": self.broker_clock.get("residual_seconds"),
+                   "max_clock_skew_seconds": self.config.safety.max_clock_skew_seconds,
+                   "max_spread": self.config.risk.max_spread_price}
+        try:
+            payload["spread"] = round(self.client.get_tick(self.config.symbol).spread, 3)
+        except Exception:
+            payload["spread"] = None
+        try:
+            account = self.client.account_state()
+            payload["margin_free"] = round(account.margin_free, 2)
+            payload["margin_required"] = round(estimate_pair_margin(self.client, self.config), 2)
+        except Exception:
+            payload["margin_free"] = payload["margin_required"] = None
+        if next_retry is not None:
+            payload["next_retry_utc"] = next_retry.isoformat()
+            payload["next_retry_local"] = next_retry.astimezone(ZoneInfo(self.config.display_timezone)).strftime("%H:%M:%S %Z")
+        elif result.retryable:
+            payload["next_retry_local"] = "automatic on the next cycle"
+        else:
+            payload["next_retry_local"] = "no — needs a config/account change"
+        self.logger.event("scout_open_failed", payload)
 
     def _intermarket(self, closed: dict[str, pd.DataFrame], now: datetime) -> dict[str, Any]:
         """v3.1.0: load silver from the same terminal and assess correlation/SMT. Any failure → UNAVAILABLE, never blocks the cycle."""

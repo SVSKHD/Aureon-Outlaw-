@@ -87,7 +87,9 @@ def cli() -> int:
         if eligible:
             discord_box.put(_discord_then_mark, kind, payload, event_id)
     logger.event = fanout
-    client = MT5Client(mt5_terminal_path(), config.safety.deal_history_max_days, symbol=config.symbol)
+    client = MT5Client(mt5_terminal_path(), config.safety.deal_history_max_days, symbol=config.symbol,
+                       broker_utc_offset_hours=config.safety.broker_utc_offset_hours,
+                       offset_remeasure_seconds=config.safety.broker_offset_remeasure_seconds)
     try:
         validation = client.initialize()                                            # attach to the logged-in terminal; no credentials
     except Exception as exc:
@@ -125,6 +127,7 @@ def cli() -> int:
                 print(format_report(snapshot, config.display_timezone), flush=True)
                 discord_box.put(discord.on_snapshot, snapshot, config.display_timezone)
                 firestore_box.put(sink.on_snapshot, snapshot, tdate, first_cycle or engine.session_boundary_event)
+                telemetry.record_broker_clock(engine.broker_clock)                      # v3.3.0 → heartbeat.json
                 telemetry.record_cycle((time.time() - t0) * 1000, {"action": snapshot.decision.action.value, "session": snapshot.session.value,
                                                                   "freshness": snapshot.freshness.value, "spread": snapshot.spread,
                                                                   "confluence": snapshot.confluence, "market_speed": snapshot.scout.market_speed,
@@ -148,6 +151,7 @@ def cli() -> int:
                     try:
                         client.reconnect()
                         from .history import reset_history_cache; reset_history_cache()
+                        engine.broker_clock = {}                      # v3.3.0: offset re-detected on the next cycle
                         engine.last_cycle = None                      # re-run bootstrap: adopt positions, re-validate clock
                         engine.startup_cycle = True
                         logger.event("restart", {"kind": "mt5_reconnect"}); consecutive_errors = 0

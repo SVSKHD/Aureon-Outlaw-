@@ -57,6 +57,10 @@ class SafetyConfig(BaseModel):
     max_m1_age_seconds: int = Field(default=300, ge=60)
     retry_count: int = Field(default=1, ge=0, le=3)
     max_clock_skew_seconds: int = Field(default=600, ge=60)
+    # v3.3.0: MT5 reports tick/bar times in the BROKER SERVER timezone. null = auto-detect the offset each
+    # hour and quantise it to the nearest 30 min; a float pins it (e.g. 3.0 for a UTC+3 server).
+    broker_utc_offset_hours: float | None = Field(default=None, ge=-24.0, le=24.0)
+    broker_offset_remeasure_seconds: int = Field(default=3600, ge=60)
     transition_retry_limit: int = Field(default=5, ge=0)
     repair_missing_scout_leg: bool = True
     scout_repair_max_session_fraction: float = Field(default=0.5, ge=0, le=1)

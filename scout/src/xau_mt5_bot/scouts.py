@@ -7,7 +7,7 @@ from typing import Any, Callable
 from .config import BotConfig
 from .models import ScoutSnapshot, ScoutVerdict, SessionName, Side
 from .execution import account_is_safe, normalize_price, normalize_volume, send_with_retry
-from .mt5_client import OrderResult, TradingClient
+from .mt5_client import OrderResult, TradingClient, position_open_time
 from .sessions import SessionBoundary
 
 
@@ -41,6 +41,7 @@ class ScoutManager:
         self.fingerprint: str = ""                        # set by the engine before restore()
         self.account_key: str = ""
         self._pending_stats: dict | None = None            # session summary awaiting confirmed closure (v2.0.0 item 4)
+        self.failed_attempts: dict[str, int] = {}          # v3.3.0: consecutive failed placements per session, cleared on success
 
     def _send(self, side: str, lot: float, magic: int, comment: str) -> OrderResult:
         """Every scout order goes through normalisation, order_check, retry and fill verification (item 5)."""
@@ -147,11 +148,12 @@ class ScoutManager:
             if session == current:
                 self.current_session = session
                 self.session_open_price = sum(float(p.price_open) for p in positions) / len(positions)
-                t = getattr(positions[0], "time", None)
-                self.session_open_time = datetime.fromtimestamp(int(t), tz=UTC) if isinstance(t, (int, float)) else now.astimezone(UTC)
+                self.session_open_time = position_open_time(self.client, positions[0], now.astimezone(UTC))   # v3.3.0
                 adopted = True
                 self.audit("scout_adopted", {"session": session.value, "tickets": [int(p.ticket) for p in positions], "legs": len(positions),
-                                             "mfe_mae_restored": [int(p.ticket) in self.extrema for p in positions]})
+                                             "mfe_mae_restored": [int(p.ticket) in self.extrema for p in positions],
+                                             "open_price": round(self.session_open_price, 2) if self.session_open_price else None,
+                                             "open_time": self.session_open_time.isoformat() if self.session_open_time else None})
             else:
                 for p in positions:
                     self._close(int(p.ticket), self.magic(session), "stale pair after restart")
@@ -224,9 +226,12 @@ class ScoutManager:
             return ScoutTransitionResult(False, f"BUY scout failed: {buy.retcode} {buy.message}")
         sell = self._send("SELL", lot, magic, f"SCOUT_{session.value}_SELL")
         if not sell.success:
+            rolled_back = [int(p.ticket) for p in self.client.positions(self.config.symbol, magic)]
             for p in self.client.positions(self.config.symbol, magic):
                 self._close(int(p.ticket), magic, "rollback: SELL leg failed")
-            self.audit("scout_rollback", {"session": session.value, "reason": sell.message, "pending": len(self.pending_closures)})
+            self.audit("scout_rollback", {"session": session.value, "failed_leg": "SELL", "retcode": sell.retcode,
+                                          "reason": sell.message, "closed_tickets": rolled_back,
+                                          "pending": len(self.pending_closures)})
             return ScoutTransitionResult(False, f"SELL scout failed; BUY rolled back: {sell.retcode} {sell.message}")
         positions = self.client.positions(self.config.symbol, magic)
         if len(positions) != 2:
@@ -245,7 +250,13 @@ class ScoutManager:
         self.session_open_price = (tick.bid + tick.ask) / 2
         self.session_open_time = timestamp.astimezone(UTC)
         self.price_samples = []
-        self.audit("scout_session_open", {"session": session.value, "magic": magic, "lot": lot, "open_price": round(self.session_open_price, 2)})
+        self.audit("scout_session_open", {                                          # v3.3.0: the whole placement, not a headline
+            "session": session.value, "magic": magic, "lot": lot, "open_price": round(self.session_open_price, 2),
+            "buy_ticket": int(buy_positions[0].ticket), "buy_entry": round(float(buy_positions[0].price_open), 2),
+            "sell_ticket": int(sell_positions[0].ticket), "sell_entry": round(float(sell_positions[0].price_open), 2),
+            "emergency_sl_price_distance": self.config.risk.emergency_scout_sl_price,
+            "after_failed_attempts": self.failed_attempts.pop(session.value, 0),
+        })
         return ScoutTransitionResult(True, f"Opened paired {session.value} scouts")
 
     def close_session(self, session: SessionName) -> ScoutTransitionResult:
@@ -288,6 +299,7 @@ class ScoutManager:
             if self._pending_stats is None or self._pending_stats.get("session") != session.value or len(positions) == 2:
                 self._pending_stats = summary                               # v2.1.0 item 9: a one-leg retry never overwrites the pair summary
                 self._persist()
+        closed_tickets = {("BUY" if int(getattr(p, "type", 1)) == 0 else "SELL"): int(p.ticket) for p in positions}
         results = [self._close(int(position.ticket), magic, f"session {session.value} close") for position in positions]
         all_ok = all(results)
         if not all_ok or self.client.positions(self.config.symbol, magic):
@@ -297,7 +309,16 @@ class ScoutManager:
             self.audit_once("scout_session_stats", stats.get("stats_key") or f"{self.account_key}:{self.config.symbol}:{self.fingerprint}:{stats['session_id']}", stats)   # §5.2 scoped key; raises → pending kept
             self._pending_stats = None; self.calibration_sessions += 1
             self._persist()
-        self.audit("scout_session_close", {"session": session.value, "magic": magic})
+        closing = self.last_closed_summary or {}
+        self.audit("scout_session_close", {                                          # v3.3.0: full pair result
+            "session": session.value, "magic": magic,
+            "buy_ticket": closed_tickets.get("BUY"), "sell_ticket": closed_tickets.get("SELL"),
+            "buy_pnl": closing.get("buy_pnl"), "sell_pnl": closing.get("sell_pnl"),
+            "pnl": round(float(closing.get("buy_pnl") or 0) + float(closing.get("sell_pnl") or 0), 2),
+            "buy_mfe": closing.get("buy_mfe"), "buy_mae": closing.get("buy_mae"),
+            "sell_mfe": closing.get("sell_mfe"), "sell_mae": closing.get("sell_mae"),
+            "leader": closing.get("leader"), "verdict": closing.get("verdict"), "strength": closing.get("strength"),
+        })
         self.extrema.clear()
         self.price_samples = []
         self._persist()

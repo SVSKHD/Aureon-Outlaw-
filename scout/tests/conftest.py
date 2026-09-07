@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,11 +8,17 @@ import pandas as pd
 import pytest
 
 from xau_mt5_bot.config import load_config
-from xau_mt5_bot.mt5_client import AccountState, OrderResult, Tick
+from xau_mt5_bot.mt5_client import AccountState, BrokerClock, OrderResult, Tick
 
 
 class FakeClient:
-    def __init__(self, hedging: bool = True, demo: bool = True) -> None:
+    """`self.tick` always carries the TRUE UTC instant. `broker_offset_hours` simulates a broker server on a
+    non-UTC clock (a UTC+3 server reports its own wall clock as the MT5 epoch), and `clock_skew_seconds`
+    simulates genuine skew on top of that. Everything the client hands out is converted back to UTC through
+    `self.clock`, exactly as MT5Client does (v3.3.0)."""
+
+    def __init__(self, hedging: bool = True, demo: bool = True, broker_offset_hours: float = 0.0,
+                 manual_offset_hours: float | None = None) -> None:
         self.hedging = hedging
         self.demo = demo
         self._positions: list[SimpleNamespace] = []
@@ -21,6 +27,31 @@ class FakeClient:
         self.closed: list[tuple[int, int]] = []
         self.deals: dict[int, list[dict]] = {}
         self.sent: list[dict] = []
+        self.broker_offset_hours = broker_offset_hours
+        self.clock_skew_seconds = 0.0
+        self.server = "FakeBroker-Demo"
+        self.clock = BrokerClock(manual_offset_hours)
+        self.offset_measurements = 0
+        self.frames: dict[str, pd.DataFrame] = {}
+
+    # -- v3.3.0 broker clock -------------------------------------------------------------------
+    def _broker_epoch(self) -> float:
+        """What MT5 would report for the latest tick: the broker's wall clock, as epoch seconds."""
+        return (self.tick.time + timedelta(hours=self.broker_offset_hours, seconds=self.clock_skew_seconds)).timestamp()
+
+    def broker_clock(self) -> dict:
+        return self.clock.info()
+
+    def refresh_broker_offset(self, now: datetime | None = None, force: bool = False) -> dict:
+        now = (now or datetime.now(UTC)).astimezone(UTC)
+        epoch = self._broker_epoch()
+        if force or self.clock.due(now):
+            self.offset_measurements += 1
+            return self.clock.measure(epoch, now, server=self.server)
+        raw = datetime.fromtimestamp(epoch, tz=UTC)
+        self.clock.raw_delta_seconds = (raw - now).total_seconds()
+        self.clock.residual_seconds = (raw - self.clock.broker_utc_offset - now).total_seconds()
+        return self.clock.info()
 
     def account_state(self) -> AccountState:
         return AccountState(1, 50000, 50000, 45000, True, self.demo, self.hedging)
@@ -30,10 +61,16 @@ class FakeClient:
                                trade_tick_size=0.01, trade_tick_value=1.0, trade_stops_level=0, trade_freeze_level=0)
 
     def get_tick(self, symbol: str) -> Tick:
-        return self.tick
+        return Tick(self.clock.epoch_to_utc(self._broker_epoch()), self.tick.bid, self.tick.ask)
 
     def get_bars(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
-        raise NotImplementedError
+        frame = self.frames.get(timeframe)
+        if frame is None:
+            raise NotImplementedError
+        raw = frame.copy()
+        raw["time"] = pd.to_datetime(raw["time"], utc=True) + pd.Timedelta(hours=self.broker_offset_hours)
+        raw["time"] = self.clock.frame_to_utc(raw["time"])           # single conversion point, as in MT5Client
+        return raw.tail(count).reset_index(drop=True)
 
     def positions(self, symbol: str | None = None, magic: int | None = None):
         values = [p for p in self._positions if symbol is None or p.symbol == symbol]

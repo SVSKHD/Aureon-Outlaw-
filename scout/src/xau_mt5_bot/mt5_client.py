@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 import pandas as pd
@@ -45,6 +45,107 @@ class OrderResult:
     position_tickets: tuple[int, ...] = ()
 
 
+
+OFFSET_QUANTUM_MINUTES = 30
+"""Broker server clocks sit on whole- or half-hour UTC offsets, so the raw tick-vs-system delta is
+rounded to the nearest 30 minutes. Whatever is left over is genuine skew, not a timezone."""
+
+
+def quantize_offset(delta: timedelta, quantum_minutes: int = OFFSET_QUANTUM_MINUTES) -> timedelta:
+    """Round a raw (broker wall clock − system UTC) delta to the nearest broker timezone offset."""
+    step = quantum_minutes * 60
+    return timedelta(seconds=round(delta.total_seconds() / step) * step)
+
+
+class BrokerClock:
+    """The single conversion point between broker server time and true UTC (v3.3.0).
+
+    MetaTrader5 reports `symbol_info_tick().time`, `copy_rates_*()['time']`, deal times and position
+    times as epoch seconds of the BROKER SERVER's wall clock, not of UTC. A broker on UTC+3 therefore
+    looks like a 10 800 s clock skew to anything that compares those values with `datetime.now(UTC)`.
+
+    `broker_utc_offset` is that timezone offset; `residual_seconds` is what is left after removing it,
+    which is the only number the order-safety clock guard should ever look at.
+    """
+
+    def __init__(self, manual_offset_hours: float | None = None, remeasure_seconds: float = 3600.0) -> None:
+        self.manual_offset_hours = manual_offset_hours
+        self.remeasure_seconds = remeasure_seconds
+        self.broker_utc_offset: timedelta = (
+            timedelta(hours=float(manual_offset_hours)) if manual_offset_hours is not None else timedelta(0)
+        )
+        self.offset_source: str = "manual" if manual_offset_hours is not None else "unmeasured"
+        self.residual_seconds: float = 0.0
+        self.raw_delta_seconds: float = 0.0
+        self.measured_at: datetime | None = None
+        self.server: str = ""
+
+    # -- conversion ----------------------------------------------------------------------------
+    def to_utc(self, moment: datetime) -> datetime:
+        """Broker-server timestamp (read as if it were UTC) → true UTC."""
+        return moment - self.broker_utc_offset
+
+    def to_broker(self, moment: datetime) -> datetime:
+        """True UTC → the broker-server timestamp MT5 expects in history queries."""
+        return moment + self.broker_utc_offset
+
+    def epoch_to_utc(self, epoch: float) -> datetime:
+        return self.to_utc(datetime.fromtimestamp(float(epoch), tz=UTC))
+
+    def frame_to_utc(self, series: "pd.Series") -> "pd.Series":
+        return series - pd.Timedelta(self.broker_utc_offset)
+
+    # -- measurement ---------------------------------------------------------------------------
+    def due(self, now: datetime) -> bool:
+        if self.manual_offset_hours is not None:
+            return self.measured_at is None                      # measured once, only to report the residual
+        return self.measured_at is None or (now - self.measured_at).total_seconds() >= self.remeasure_seconds
+
+    def measure(self, broker_epoch: float, now: datetime, server: str = "") -> dict[str, Any]:
+        """Detect the offset from one broker timestamp. Manual override wins; the residual is always recomputed."""
+        raw = datetime.fromtimestamp(float(broker_epoch), tz=UTC)
+        delta = raw - now.astimezone(UTC)
+        self.raw_delta_seconds = delta.total_seconds()
+        if self.manual_offset_hours is not None:
+            self.broker_utc_offset = timedelta(hours=float(self.manual_offset_hours))
+            self.offset_source = "manual"
+        else:
+            self.broker_utc_offset = quantize_offset(delta)
+            self.offset_source = "auto"
+        self.residual_seconds = (delta - self.broker_utc_offset).total_seconds()
+        self.measured_at = now.astimezone(UTC)
+        if server:
+            self.server = server
+        return self.info()
+
+    def invalidate(self) -> None:
+        """Forget the measurement so the next cycle re-detects (used on reconnect)."""
+        self.measured_at = None
+
+    def info(self) -> dict[str, Any]:
+        return {
+            "offset_hours": round(self.broker_utc_offset.total_seconds() / 3600.0, 2),
+            "offset_seconds": round(self.broker_utc_offset.total_seconds(), 1),
+            "residual_seconds": round(self.residual_seconds, 1),
+            "raw_delta_seconds": round(self.raw_delta_seconds, 1),
+            "source": self.offset_source,
+            "server": self.server,
+            "measured_at": self.measured_at.isoformat() if self.measured_at else None,
+        }
+
+
+def position_open_time(client: Any, position: Any, default: datetime) -> datetime:
+    """MT5 `position.time` is broker-server epoch seconds. Convert it through the client's BrokerClock so
+    adopted/tracked positions carry true UTC open times (v3.3.0). Clients without a clock fall back to raw UTC."""
+    raw = getattr(position, "time", None)
+    if not isinstance(raw, (int, float)):
+        return default
+    clock = getattr(client, "clock", None)
+    if isinstance(clock, BrokerClock):
+        return clock.epoch_to_utc(raw)
+    return datetime.fromtimestamp(float(raw), tz=UTC)
+
+
 class TradingClient(Protocol):
     def get_tick(self, symbol: str) -> Tick: ...
     def get_bars(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame: ...
@@ -62,13 +163,16 @@ class TradingClient(Protocol):
     def modify_sltp(self, ticket: int, sl: float, tp: float, expected_magic: int) -> OrderResult: ...
     def close_partial(self, ticket: int, volume: float, expected_magic: int, comment: str = "PA_PARTIAL") -> OrderResult: ...
     def account_id(self) -> str: ...
+    def broker_clock(self) -> dict[str, Any]: ...
+    def refresh_broker_offset(self, now: datetime | None = None, force: bool = False) -> dict[str, Any]: ...
 
 
 class MT5Client:
     TIMEFRAMES: dict[str, int] = {}
 
     def __init__(self, terminal_path: str | None = None, deal_history_max_days: int = 3650, symbol: str = "XAUUSD",
-                 tick_max_age_seconds: int = 120) -> None:
+                 tick_max_age_seconds: int = 120, broker_utc_offset_hours: float | None = None,
+                 offset_remeasure_seconds: float = 3600.0) -> None:
         if mt5 is None:
             raise RuntimeError("MetaTrader5 package is unavailable; run this bot on Windows with MT5")
         self.terminal_path = terminal_path or None
@@ -76,6 +180,7 @@ class MT5Client:
         self.symbol = symbol
         self.tick_max_age_seconds = tick_max_age_seconds
         self.validation: dict[str, Any] = {}
+        self.clock = BrokerClock(broker_utc_offset_hours, offset_remeasure_seconds)
         self.TIMEFRAMES = {
             "M1": mt5.TIMEFRAME_M1,
             "M5": mt5.TIMEFRAME_M5,
@@ -113,8 +218,11 @@ class MT5Client:
         info = mt5.symbol_info(self.symbol)
         tick = mt5.symbol_info_tick(self.symbol)
         if tick is None: raise RuntimeError(f"No tick for {self.symbol}: {mt5.last_error()}")
-        age = (datetime.now(UTC) - datetime.fromtimestamp(tick.time, tz=UTC)).total_seconds()
-        if age > self.tick_max_age_seconds: raise RuntimeError(f"{self.symbol} tick is stale ({age:.0f}s old)")
+        # v3.3.0: MT5 timestamps are broker-server wall clock. Detect the timezone offset FIRST, then judge
+        # staleness on what is left over — otherwise a UTC+3 broker looks 3 h stale at every startup.
+        clock = self.clock.measure(tick.time, datetime.now(UTC), server=str(getattr(account, "server", "")))
+        age = (datetime.now(UTC) - self.clock.epoch_to_utc(tick.time)).total_seconds()
+        if age > self.tick_max_age_seconds: raise RuntimeError(f"{self.symbol} tick is stale ({age:.0f}s old after removing the {clock['offset_hours']:+g} h broker offset)")
         if float(info.volume_min) <= 0 or float(info.volume_step) <= 0 or float(info.volume_max) < float(info.volume_min):
             raise RuntimeError(f"Invalid volume constraints for {self.symbol}")
         self.validation = {
@@ -124,6 +232,8 @@ class MT5Client:
             "symbol": self.symbol, "symbol_visible": bool(info.visible), "tick_age_seconds": round(age, 1),
             "volume_min": float(info.volume_min), "volume_step": float(info.volume_step), "volume_max": float(info.volume_max),
             "terminal_path": self.terminal_path, "validated_at": datetime.now(UTC).isoformat(),
+            "broker_utc_offset_hours": clock["offset_hours"], "broker_clock_residual_seconds": clock["residual_seconds"],
+            "broker_clock_source": clock["source"],
         }
         return self.validation
 
@@ -131,6 +241,7 @@ class MT5Client:
         """shutdown → bounded back-off → initialize (with full validation). No credentials are ever used."""
         import time as _time
         sleep = sleep or _time.sleep
+        self.clock.invalidate()                       # v3.3.0: a new server/session may sit on a different offset
         last: Exception | None = None
         for attempt in range(attempts):
             try: mt5.shutdown()
@@ -161,7 +272,7 @@ class MT5Client:
         value = mt5.symbol_info_tick(symbol)
         if value is None:
             raise RuntimeError(f"No live tick for {symbol}: {mt5.last_error()}")
-        return Tick(datetime.fromtimestamp(value.time, tz=UTC), float(value.bid), float(value.ask))
+        return Tick(self.clock.epoch_to_utc(value.time), float(value.bid), float(value.ask))
 
     def get_bars(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
         self.ensure_symbol(symbol)
@@ -171,8 +282,9 @@ class MT5Client:
         if rates is None or len(rates) == 0:
             raise RuntimeError(f"No {timeframe} data for {symbol}: {mt5.last_error()}")
         frame = pd.DataFrame(rates)
-        # MT5 Unix timestamps are UTC instants; never apply a broker-offset subtraction.
-        frame["time"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+        # v3.3.0: MT5 bar stamps are broker-server wall clock read as epoch seconds. Subtract the detected
+        # broker offset here so every downstream consumer (sessions, freshness, sweeps, cards) sees true UTC.
+        frame["time"] = self.clock.frame_to_utc(pd.to_datetime(frame["time"], unit="s", utc=True))
         return frame.sort_values("time").reset_index(drop=True)
 
     def account_state(self) -> AccountState:
@@ -274,7 +386,8 @@ class MT5Client:
         """Exit deal of a closed position (for P/L, exit price, exit reason)."""
         from datetime import timedelta
         start = (opened_at.astimezone(UTC) - timedelta(days=1)) if opened_at else datetime.now(UTC) - timedelta(days=self.deal_history_max_days)
-        deals = mt5.history_deals_get(start, datetime.now(UTC) + timedelta(days=1), position=position_ticket)
+        # MT5 interprets history_deals_get() bounds in broker-server time (v3.3.0).
+        deals = mt5.history_deals_get(self.clock.to_broker(start), self.clock.to_broker(datetime.now(UTC) + timedelta(days=1)), position=position_ticket)
         if not deals: return None
         out = [d for d in deals if int(d.entry) == getattr(mt5, "DEAL_ENTRY_OUT", 1)]
         if not out: return None
@@ -282,13 +395,14 @@ class MT5Client:
         reasons = {getattr(mt5, "DEAL_REASON_SL", 4): "SL", getattr(mt5, "DEAL_REASON_TP", 5): "TP", getattr(mt5, "DEAL_REASON_SO", 6): "STOP_OUT",
                    getattr(mt5, "DEAL_REASON_EXPERT", 3): "BOT", getattr(mt5, "DEAL_REASON_CLIENT", 0): "MANUAL"}
         return {"price": float(d.price), "profit": float(d.profit) + float(getattr(d, "commission", 0)) + float(getattr(d, "swap", 0)),
-                "time": datetime.fromtimestamp(int(d.time), tz=UTC), "reason": reasons.get(int(d.reason), str(d.reason)), "volume": float(d.volume)}
+                "time": self.clock.epoch_to_utc(int(d.time)), "reason": reasons.get(int(d.reason), str(d.reason)), "volume": float(d.volume)}
 
     def closed_deals(self, position_ticket: int, opened_at: datetime | None = None) -> list[dict]:
         """All exit deals for a position, including partial exits and costs."""
         from datetime import timedelta
         start = (opened_at.astimezone(UTC) - timedelta(days=1)) if opened_at else datetime.now(UTC) - timedelta(days=self.deal_history_max_days)
-        deals = mt5.history_deals_get(start, datetime.now(UTC) + timedelta(days=1), position=position_ticket)
+        # MT5 interprets history_deals_get() bounds in broker-server time (v3.3.0).
+        deals = mt5.history_deals_get(self.clock.to_broker(start), self.clock.to_broker(datetime.now(UTC) + timedelta(days=1)), position=position_ticket)
         if not deals:
             return []
         reasons = {getattr(mt5, "DEAL_REASON_SL", 4): "SL", getattr(mt5, "DEAL_REASON_TP", 5): "TP",
@@ -301,7 +415,7 @@ class MT5Client:
             out.append({"deal_ticket": int(d.ticket), "price": float(d.price), "profit": float(d.profit),
                         "commission": float(getattr(d, "commission", 0)), "swap": float(getattr(d, "swap", 0)),
                         "net": float(d.profit) + float(getattr(d, "commission", 0)) + float(getattr(d, "swap", 0)),
-                        "time": datetime.fromtimestamp(int(d.time), tz=UTC), "reason": reasons.get(int(d.reason), str(d.reason)),
+                        "time": self.clock.epoch_to_utc(int(d.time)), "reason": reasons.get(int(d.reason), str(d.reason)),
                         "volume": float(d.volume)})
         return out
 
@@ -309,6 +423,26 @@ class MT5Client:
         is_buy = side.upper() in {"BUY", "LONG"}
         value = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL, symbol, float(volume), float(price_open), float(price_close))
         return float(value) if value is not None else None
+
+    def broker_clock(self) -> dict[str, Any]:
+        return self.clock.info()
+
+    def refresh_broker_offset(self, now: datetime | None = None, force: bool = False) -> dict[str, Any]:
+        """Re-detect the broker timezone offset at most once an hour (and on reconnect / when forced).
+        Always recomputes the residual skew from the live tick, which is what the order clock guard reads."""
+        now = (now or datetime.now(UTC)).astimezone(UTC)
+        if not (force or self.clock.due(now)):
+            value = mt5.symbol_info_tick(self.symbol)
+            if value is not None:
+                raw = datetime.fromtimestamp(value.time, tz=UTC)
+                self.clock.raw_delta_seconds = (raw - now).total_seconds()
+                self.clock.residual_seconds = (raw - self.clock.broker_utc_offset - now).total_seconds()
+            return self.clock.info()
+        value = mt5.symbol_info_tick(self.symbol)
+        if value is None:
+            raise RuntimeError(f"No live tick for {self.symbol}: {mt5.last_error()}")
+        info = mt5.account_info()
+        return self.clock.measure(value.time, now, server=str(getattr(info, "server", "")) if info else "")
 
     def account_id(self) -> str:
         info = mt5.account_info()

@@ -79,6 +79,24 @@ def account_is_safe(client: TradingClient, config: BotConfig, for_scouts: bool =
     return True, "Account safety checks passed"
 
 
+def estimate_pair_margin(client: TradingClient, config: BotConfig) -> float:
+    """Best-effort margin needed for BOTH scout legs, for the SCOUTS NOT PLACED card (v3.3.0).
+
+    Uses the symbol's own `margin_initial` when the broker publishes it; otherwise contract value / leverage.
+    Reporting only — the authoritative check stays broker-side `order_check`."""
+    info = client.symbol_info(config.symbol)
+    volume = 2 * normalize_volume(config.risk.scout_lot, info)
+    per_lot = float(getattr(info, "margin_initial", 0) or 0)
+    if per_lot > 0:
+        return per_lot * volume
+    contract = float(getattr(info, "trade_contract_size", 0) or 0)
+    leverage = float(getattr(client.account_state(), "leverage", 0) or 0) or 100.0
+    if contract <= 0:
+        return 0.0
+    price = client.get_tick(config.symbol).ask
+    return contract * price * volume / leverage
+
+
 def send_with_retry(client: TradingClient, config: BotConfig, symbol: str, side: str, volume: float, magic: int, comment: str,
                     sl: float = 0.0, tp: float = 0.0, audit=None) -> OrderResult:
     """Validate, send, and accept only the volume confirmed in MT5 positions.
