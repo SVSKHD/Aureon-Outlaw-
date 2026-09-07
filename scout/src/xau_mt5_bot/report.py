@@ -90,6 +90,9 @@ HISTORICAL RELIABILITY (comparable setups decided before now; not a guarantee)
 SESSION TARGET (${snapshot.analysis.get('session_target', {}).get('session_target_price_move', 10):.0f} XAUUSD price move)
 {_target_line(snapshot)}
 
+DECISION TRACE
+{_trace_block(snapshot)}
+
 FINAL DECISION (DEMO ACCOUNT ONLY)
 signal_go: {snapshot.go_status} | trade_action: {snapshot.decision.action.value} | scout_verdict: {scout.verdict.value} | target_verdict: {snapshot.analysis.get('session_target', {}).get('target_verdict', 'DISABLED')} | calibration: {snapshot.reporting.get('calibration_status', 'COLLECTING')}
 Reason: {snapshot.decision.reason}
@@ -120,3 +123,29 @@ def _target_line(snapshot) -> str:
             f"· {t.get('remaining_session_minutes')} min left · pace {t.get('current_velocity')} vs required {t.get('required_velocity')} /min · session range {t.get('session_range')} "
             f"(consumed {t.get('session_range_consumed')}) · est. remaining {t.get('estimated_remaining_range')} · blocker {t.get('nearest_blocking_liquidity')} at {t.get('distance_to_blocking_liquidity')}\n"
             f"Why: {t.get('target_reason')}")
+
+
+def _trace_block(snapshot) -> str:
+    """v3.3.0: the verdict, every gate that failed and what would flip it — printed every cycle."""
+    trace = snapshot.analysis.get("decision_trace") or {}
+    if not trace:
+        return "unavailable"
+    blocked = trace.get("blocked_by") or []
+    lines = [f"Verdict: {trace.get('verdict')}",
+             f"Gates: {trace.get('passed_count')}/{trace.get('gate_count')} passed"]
+    if blocked:
+        lines.append("Blocked by:")
+        lines += [f"  - {g.get('name')}: {g.get('value')}"
+                  + (f" (needs {g.get('threshold')})" if g.get("threshold") not in (None, "") else "")
+                  + (f" — {g.get('note')}" if g.get("note") else "") for g in blocked]
+    if trace.get("next"):
+        lines.append("Next: " + "; ".join(str(x) for x in trace["next"][:4]))
+    evidence = trace.get("evidence") or {}
+    for label in ("long", "short"):
+        items = evidence.get(label) or []
+        if items:
+            lines.append(f"Evidence {label.upper()} ({evidence.get(label + '_score')}): "
+                         + ", ".join(f"{i['label']} +{i['points']}" for i in items))
+    lines.append(f"Silver: {evidence.get('silver', 'n/a')}")
+    lines.append(trace.get("go_meaning", ""))
+    return "\n".join(x for x in lines if x)

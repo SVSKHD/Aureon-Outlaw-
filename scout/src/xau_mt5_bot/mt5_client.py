@@ -116,10 +116,15 @@ class BrokerClock:
             self.offset_source = "manual"
         else:
             candidate = quantize_offset(delta)
-            # A broker timezone changes by whole hours (DST). A sub-hour "change" against an offset we already
-            # hold is drift in one of the two clocks, so keep the established offset and let it show as skew —
-            # otherwise a slow PC would be silently absorbed and every timestamp would shift with it.
-            if self.measured_at is not None and abs((candidate - self.broker_utc_offset).total_seconds()) < 3600:
+            # Every MT5 server timezone lives on the half-hour grid. A difference that does NOT sit on that grid
+            # is a broken clock, not a timezone: refuse it rather than invent an offset from it (master PR #3).
+            on_grid = abs((delta - candidate).total_seconds()) <= OFFSET_CONFIDENCE_SECONDS
+            # And a broker timezone changes by whole hours (DST). A sub-hour "change" against an offset we
+            # already hold is drift in one of the two clocks, so keep the established offset and let it show
+            # as skew — otherwise a slow PC would be absorbed and every timestamp would shift with it.
+            sub_hour_drift = (self.measured_at is not None
+                              and 0 < abs((candidate - self.broker_utc_offset).total_seconds()) < 3600)
+            if not on_grid or sub_hour_drift:
                 candidate = self.broker_utc_offset
             self.broker_utc_offset = candidate
             self.offset_source = "auto"
@@ -187,7 +192,11 @@ class MT5Client:
 
     def __init__(self, terminal_path: str | None = None, deal_history_max_days: int = 3650, symbol: str = "XAUUSD",
                  tick_max_age_seconds: int = 120, broker_utc_offset_hours: float | None = None,
-                 offset_remeasure_seconds: float = 3600.0) -> None:
+                 offset_remeasure_seconds: float = 3600.0,
+                 broker_timestamp_offset_seconds: float | None = None) -> None:
+        # `broker_timestamp_offset_seconds` is the legacy seconds form of the same pin (master PR #2/#3 API).
+        if broker_utc_offset_hours is None and broker_timestamp_offset_seconds is not None:
+            broker_utc_offset_hours = float(broker_timestamp_offset_seconds) / 3600.0
         if mt5 is None:
             raise RuntimeError("MetaTrader5 package is unavailable; run this bot on Windows with MT5")
         self.terminal_path = terminal_path or None
@@ -237,6 +246,9 @@ class MT5Client:
         # staleness on what is left over — otherwise a UTC+3 broker looks 3 h stale at every startup.
         clock = self.clock.measure(tick.time, datetime.now(UTC), server=str(getattr(account, "server", "")))
         age = (datetime.now(UTC) - self.clock.epoch_to_utc(tick.time)).total_seconds()
+        if age < -OFFSET_CONFIDENCE_SECONDS:
+            raise RuntimeError(f"{self.symbol} tick is {-age:.0f}s in the future after the {clock['offset_hours']:+g} h broker "
+                               f"offset — that difference is not a timezone; check the PC clock")
         if age > self.tick_max_age_seconds: raise RuntimeError(f"{self.symbol} tick is stale ({age:.0f}s old after removing the {clock['offset_hours']:+g} h broker offset)")
         if float(info.volume_min) <= 0 or float(info.volume_step) <= 0 or float(info.volume_max) < float(info.volume_min):
             raise RuntimeError(f"Invalid volume constraints for {self.symbol}")

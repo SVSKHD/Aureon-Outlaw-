@@ -96,6 +96,59 @@ def _fields(*pairs: tuple[str, str, bool]) -> list[dict[str, Any]]:
     return [{"name": n, "value": (v or "—")[:1024], "inline": i} for n, v, i in pairs]
 
 
+# --- ported from master (PR #3): reliability and "what to watch next", features the decision card does not cover ---
+def fakeout_text(s: dict[str, Any]) -> str:
+    r = _g(s, "analysis", "historical_pattern_reliability", default={})
+    n = r.get("samples", 0)
+    rate = r.get("fakeout_rate")
+    if r.get("status") != "SUFFICIENT_SAMPLE" or not isinstance(rate, (int, float)) or not 0 <= rate <= 1:
+        return f"UNAVAILABLE - insufficient comparable history (n={n}). No invented score."
+    ci = r.get("confidence_interval_fakeout")
+    interval = f" · 95% interval {_f(ci[0] * 100, 1)}–{_f(ci[1] * 100, 1)}%" if isinstance(ci, (list, tuple)) and len(ci) == 2 else ""
+    return (f"Historical fakeout score {rate * 100:.1f}/100 · n={n}{interval}\n"
+            f"Comparison: {r.get('comparison_level', 'unknown')}. Historical frequency, not a current-trade probability.")
+
+
+def next_pattern_text(s: dict[str, Any]) -> str:
+    side = s.get("pa_side")
+    zones = [z for z in (s.get("zones") or []) if z.get("side") == side]
+    if side not in {"LONG", "SHORT"} or not zones:
+        return "No directional setup yet. Watch for a liquidity sweep/reclaim or a confirmed structure break and retest; wait for a valid zone."
+    zone = zones[0]
+    direction = "bullish" if side == "LONG" else "bearish"
+    invalidation = zone.get("low") if side == "LONG" else zone.get("high")
+    condition = "below" if side == "LONG" else "above"
+    return (f"Conditional scenario: {direction} reaction at {_f(zone.get('low'))}–{_f(zone.get('high'))} ({zone.get('kind')}). "
+            f"Then require a fresh M1/M5 {direction} trigger and scout support.\n"
+            f"M5 close {condition} {_f(invalidation)} invalidates this zone scenario. "
+            "This is what to watch next, not a prediction that it will occur.")
+
+
+def blocked_by_line(s: dict[str, Any]) -> str:
+    """Master-compatible renderer, reading the v3.4.0 trace: the gates that are not passing, in order."""
+    trace = _g(s, "analysis", "decision_trace", default={}) or {}
+    failed = [g for g in (trace.get("gates") or []) if g.get("state") != "pass"] or (s.get("blocked_by") or [])
+    if not failed:
+        return "nothing — every router gate passed"
+    return "\n".join(f"• {g.get('label') or g.get('name')} — {g.get('value')}" for g in failed[:10])
+
+
+def next_line(s: dict[str, Any]) -> str:
+    """Master-compatible renderer for "what flips it"."""
+    trace = _g(s, "analysis", "decision_trace", default={}) or {}
+    items = trace.get("flips") or trace.get("next") or []
+    return "\n".join(f"• {item}" for item in items[:6]) or "—"
+
+
+def offset_line(payload: dict[str, Any]) -> str:
+    hours = payload.get("broker_utc_offset_hours")
+    if hours is None:
+        return "not measured yet"
+    source = payload.get("broker_clock_source", "auto")
+    residual = payload.get("residual_skew_seconds", payload.get("broker_clock_residual_seconds"))
+    return f"UTC{float(hours):+g}h ({source}) · residual {_f(residual, 0)}s"
+
+
 COLOURS = {"green": GREEN, "amber": AMBER, "red": RED, "grey": GREY}
 
 

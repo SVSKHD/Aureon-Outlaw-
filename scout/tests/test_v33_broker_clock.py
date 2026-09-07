@@ -515,7 +515,7 @@ def test_established_offset_is_not_moved_by_sub_hour_drift():
     assert clean["offset_hours"] == 3.0 and clean["confident"] is True
 
     drifted = clock.measure((ASIA_NOW + timedelta(hours=3, seconds=1500)).timestamp(), ASIA_NOW)
-    assert drifted["offset_hours"] == 3.0                       # NOT re-quantised to 3.5
+    assert drifted["offset_hours"] == 3.0                       # held: off-grid, and a sub-hour change anyway
     assert drifted["residual_seconds"] == pytest.approx(1500, abs=2)
     assert drifted["confident"] is False
 
@@ -524,12 +524,16 @@ def test_established_offset_is_not_moved_by_sub_hour_drift():
     assert abs(dst["residual_seconds"]) < 5 and dst["confident"] is True
 
 
-def test_first_measurement_near_a_boundary_is_flagged_unconfident():
-    """Nothing in one tick separates 'UTC+3:30 broker' from 'UTC+3 broker, 25-min-slow PC' — say so."""
-    clock = BrokerClock()
-    info = clock.measure((ASIA_NOW + timedelta(hours=3, seconds=1500)).timestamp(), ASIA_NOW)
-    assert info["offset_hours"] == 3.5 and info["confident"] is False
-    assert abs(info["residual_seconds"]) > info["confidence_limit_seconds"]
+def test_an_off_grid_difference_is_refused_not_invented_into_a_timezone():
+    """Every MT5 server timezone sits on the half-hour grid. A difference that does not is a broken clock:
+    refuse it, so the whole difference shows as skew and the guard blocks, rather than inventing an offset."""
+    broken = BrokerClock().measure((ASIA_NOW + timedelta(seconds=1500)).timestamp(), ASIA_NOW)
+    assert broken["offset_hours"] == 0.0                                # NOT rounded up to 0.5 h
+    assert broken["residual_seconds"] == pytest.approx(1500, abs=2)     # the full error is visible
+    assert broken["confident"] is False
+
+    half = BrokerClock().measure((ASIA_NOW + timedelta(hours=3, minutes=30)).timestamp(), ASIA_NOW)
+    assert half["offset_hours"] == 3.5 and half["confident"] is True    # a real half-hour zone still works
 
     tidy = BrokerClock().measure((ASIA_NOW + timedelta(hours=3, seconds=4)).timestamp(), ASIA_NOW)
     assert tidy["offset_hours"] == 3.0 and tidy["confident"] is True
@@ -600,3 +604,106 @@ def test_clock_command_reports_the_real_broker_reading(tmp_path: Path):
     assert "+1500s skew" in reply
     assert "guard BLOCKED" in reply
     assert "pin `safety.broker_utc_offset_hours`" in reply      # unconfident reading is called out
+
+
+# --- coverage ported from master's PR #3 suite before its API-bound tests were removed ---------------------------------
+def test_validate_terminal_refuses_a_tick_from_the_future(monkeypatch):
+    """A 25-minute-ahead tick is a broken PC clock, not a timezone: refuse to start rather than trade on it."""
+    from test_mt5_adapter_contract import MockMT5
+    import xau_mt5_bot.mt5_client as adapter
+
+    fake = MockMT5()
+    fake.tick_epoch_utc = int(datetime.now(UTC).timestamp()) + 1500          # ahead, and off the half-hour grid
+    monkeypatch.setattr(adapter, "mt5", fake)
+    with pytest.raises(RuntimeError, match="future"):
+        adapter.MT5Client(symbol="XAUUSD").validate_terminal()
+
+    on_grid = MockMT5(broker_offset_hours=3.0)
+    on_grid.tick_epoch_utc = int(datetime.now(UTC).timestamp())              # exactly +3 h: a real UTC+3 server
+    monkeypatch.setattr(adapter, "mt5", on_grid)
+    validation = adapter.MT5Client(symbol="XAUUSD").validate_terminal()
+    assert validation["broker_utc_offset_hours"] == 3.0
+    assert validation["broker_clock_source"] == "auto" and abs(validation["tick_age_seconds"]) < 5
+
+
+def test_legacy_seconds_kwarg_still_pins_the_offset():
+    """master PR #2/#3 pinned the offset in seconds; that call site must keep working."""
+    import xau_mt5_bot.mt5_client as adapter
+    from types import SimpleNamespace
+
+    stub = SimpleNamespace(**{f"TIMEFRAME_{tf}": i for i, tf in enumerate(("M1", "M5", "M15", "H1", "H4", "D1"))})
+    original = adapter.mt5
+    adapter.mt5 = stub
+    try:
+        assert adapter.MT5Client(broker_timestamp_offset_seconds=10800).clock.manual_offset_hours == 3.0
+        assert adapter.MT5Client(broker_utc_offset_hours=2.0,
+                                 broker_timestamp_offset_seconds=10800).clock.manual_offset_hours == 2.0   # hours win
+    finally:
+        adapter.mt5 = original
+
+
+def test_fakeout_text_refuses_to_invent_a_score():
+    """Ported with cards.fakeout_text: an insufficient sample must say so, never produce a number."""
+    from xau_mt5_bot.cards import fakeout_text
+
+    thin = fakeout_text({"analysis": {"historical_pattern_reliability": {"status": "INSUFFICIENT", "samples": 4}}})
+    assert "UNAVAILABLE" in thin and "n=4" in thin and "No invented score" in thin
+
+    solid = fakeout_text({"analysis": {"historical_pattern_reliability": {
+        "status": "SUFFICIENT_SAMPLE", "samples": 40, "fakeout_rate": 0.32,
+        "confidence_interval_fakeout": [0.21, 0.45], "comparison_level": "LONDON/DEMAND_OB"}}})
+    assert "32.0/100" in solid and "n=40" in solid
+    assert "21.0–45.0%" in solid and "LONDON/DEMAND_OB" in solid
+    assert "not a current-trade probability" in solid
+
+
+def test_next_pattern_text_is_conditional_never_a_prediction():
+    """Ported with cards.next_pattern_text."""
+    from xau_mt5_bot.cards import next_pattern_text
+
+    idle = next_pattern_text({"pa_side": None, "zones": []})
+    assert "No directional setup yet" in idle
+
+    live = next_pattern_text({"pa_side": "LONG", "zones": [
+        {"side": "LONG", "kind": "DEMAND_OB", "low": 2496.0, "high": 2499.0}]})
+    assert "2496.00–2499.00" in live and "DEMAND_OB" in live
+    assert "M5 close below 2496.00 invalidates" in live
+    assert "not a prediction" in live
+
+
+def test_clock_command_falls_back_to_the_heartbeat(tmp_path: Path):
+    """Ported: with no trace on the snapshot, !clock still answers from data/heartbeat.json."""
+    import json
+    import shutil
+    from xau_mt5_bot.discord_bot import BotState, dispatch
+
+    shutil.copy(ROOT / "config.yaml", tmp_path / "config.yaml")
+    (tmp_path / "data" / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data" / "heartbeat.json").write_text(json.dumps({
+        "ts_epoch": 1, "broker_clock": {"offset_hours": 3.0, "residual_seconds": 2.0, "raw_delta_seconds": 10802.0,
+                                        "source": "auto", "server": "Broker-Demo03", "confident": True,
+                                        "measured_at": "2026-09-07T05:00:00+00:00"}}), encoding="utf-8")
+    reply = dispatch(BotState(tmp_path), "!clock")
+    assert "UTC+3" in reply and "Broker-Demo03" in reply and "Broker server time:" in reply
+
+
+def test_status_mode_off_sends_nothing(monkeypatch):
+    """Ported: discord_status_mode=off must suppress the periodic push entirely."""
+    from xau_mt5_bot.notify import Discord
+
+    sent: list = []
+    discord = Discord("NOPE", 0, 0, status_mode="off")
+    discord.url = "https://example.invalid/hook"
+    monkeypatch.setattr(discord, "send", lambda text="", embed=None: sent.append(embed or text) or True)
+
+    class _Snap:
+        class decision:
+            action = type("A", (), {"value": "WAIT"})()
+        entry_state = type("E", (), {"value": "INSIDE"})()
+        pa_side = "LONG"
+        session = type("S", (), {"value": "ASIA"})()
+        go_status = "NO-GO"
+
+    discord.on_snapshot(_Snap(), "UTC")
+    discord.on_snapshot(_Snap(), "UTC")
+    assert sent == []

@@ -31,6 +31,7 @@ class Discord:
         self._last_status = 0.0
         self._last_key: str | None = None
         self._last_detection_sig: str | None = None; self._last_detection_push = 0.0                 # v3.2.0
+        self._last_hour: int | None = None                                                           # v3.4.0
         self.scout_pair_min_interval = scout_pair_min_interval
         self._last_pair_event: dict[str, float] = {}
         self.retry_count = retry_count
@@ -101,15 +102,19 @@ class Discord:
             if self.send(embed=detections_card(d, tz)):
                 self._last_detection_push = now
         self._last_detection_sig = sig
-        if self.status_mode == "events":
-            return                                                                                   # v3.1.1: status only on request (!status)
+        if self.status_mode in {"events", "off"}:
+            return                                                     # v3.1.1: status only on request (!status)
         # v3.4.0: the decision card is pushed when the VERDICT or the blocking gate changes, not just the action.
         trace = ((d.get("analysis") or {}).get("decision_trace") or {}) if isinstance(d, dict) else {}
         key = (f"{s.decision.action.value}|{s.entry_state.value}|{s.pa_side}|{s.session.value}|{s.go_status}"
                f"|{trace.get('verdict')}|{trace.get('blocking_gate')}")
-        if key != self._last_key or (self.status_mode == "interval" and now - self._last_status >= self.min_interval):
+        hour = int(now // 3600)                                        # v3.4.0: `hourly` = one card an hour, plus every change
+        due = (key != self._last_key
+               or (self.status_mode == "hourly" and hour != self._last_hour)
+               or (self.status_mode == "interval" and now - self._last_status >= self.min_interval))
+        if due:
             if self.send(embed=status_card(d, tz)):
-                self._last_key, self._last_status = key, now
+                self._last_key, self._last_status, self._last_hour = key, now, hour
 
     ELIGIBLE_EVENTS: frozenset = frozenset({"session_transition", "session_summary", "weekly_report", "next_week_open_report", "scout_session_stats",
                    "scout_session_open", "scout_session_close", "scout_rollback", "scout_repair", "scout_leg_repaired", "scout_adopted",
