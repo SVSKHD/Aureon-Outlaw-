@@ -174,28 +174,29 @@ def status_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
 
 
 def _sweep_lines(s: dict[str, Any], limit: int = 6) -> list[str]:
-    """Newest first, deduped on level_type+price, with ROUND_1 collapsed to one line (v3.3.0)."""
-    active = [sw for sw in (s.get("sweeps") or []) if sw.get("active", True)]
-    active.sort(key=lambda x: x.get("age_bars", 0))
+    """Newest first, deduped on level_type+price, with ROUND_1 collapsed into one line (v3.3.0)."""
+    active = sorted((sw for sw in (s.get("sweeps") or []) if sw.get("active", True)), key=lambda x: x.get("age_bars", 0))
     seen: set[tuple[str, str]] = set()
     unique = []
     for sw in active:
         key = (str(sw.get("level_type")), _f(sw.get("level_price")))
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(sw)
+        if key not in seen:
+            seen.add(key)
+            unique.append(sw)
+
+    def render(sw: dict[str, Any]) -> str:
+        return (f"{'▲' if sw.get('direction') == 'BULLISH' else '▼'} {sw.get('level_type')} {_f(sw.get('level_price'))}"
+                f" → wick {_f(sw.get('sweep_price'))} ({sw.get('age_bars')} bars)")
+
     rounds = [sw for sw in unique if str(sw.get("level_type")) == "ROUND_1"]
-    others = [sw for sw in unique if str(sw.get("level_type")) != "ROUND_1"]
-    lines = [f"{'▲' if sw.get('direction') == 'BULLISH' else '▼'} {sw.get('level_type')} {_f(sw.get('level_price'))}"
-             f" → wick {_f(sw.get('sweep_price'))} ({sw.get('age_bars')} bars)" for sw in others[:limit]]
-    if rounds:
+    entries: list[tuple[int, str]] = [(int(sw.get("age_bars", 0)), render(sw)) for sw in unique
+                                      if str(sw.get("level_type")) != "ROUND_1"]
+    if len(rounds) == 1:
+        entries.append((int(rounds[0].get("age_bars", 0)), render(rounds[0])))
+    elif rounds:
         prices = sorted(float(sw.get("level_price") or 0) for sw in rounds)
-        collapsed = (f"ROUND_1 ×{len(rounds)} ({prices[0]:.0f}–{prices[-1]:.0f})" if len(rounds) > 1
-                     else f"{'▲' if rounds[0].get('direction') == 'BULLISH' else '▼'} ROUND_1 {_f(rounds[0].get('level_price'))}"
-                          f" → wick {_f(rounds[0].get('sweep_price'))} ({rounds[0].get('age_bars')} bars)")
-        lines.append(collapsed)
-    return lines[:limit]
+        entries.append((int(rounds[0].get("age_bars", 0)), f"ROUND_1 ×{len(rounds)} ({prices[0]:.0f}–{prices[-1]:.0f})"))
+    return [line for _, line in sorted(entries, key=lambda item: item[0])][:limit]
 
 
 def detections_card(s: dict[str, Any], tz: str, limit: int = 8) -> dict[str, Any]:
