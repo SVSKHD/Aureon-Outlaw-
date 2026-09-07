@@ -14,7 +14,7 @@ import pandas as pd
 
 from .config import BotConfig
 from .execution import normalize_price, normalize_volume
-from .mt5_client import TradingClient
+from .mt5_client import TradingClient, broker_epoch_to_utc
 
 
 class PositionManager:
@@ -130,7 +130,8 @@ class PositionManager:
     def track(self, position: Any, kind: str, session: str, invalidation_price: float | None = None, side: str | None = None,
               setup_id: str | None = None, plan: dict[str, Any] | None = None, tdate: str | None = None) -> None:
         t = getattr(position, "time", None)
-        open_time = datetime.fromtimestamp(int(t), tz=UTC) if isinstance(t, (int, float)) else datetime.now(UTC)
+        # v3.3.0: position.time is a BROKER-server epoch — converted through the client's single conversion point.
+        open_time = broker_epoch_to_utc(self.client, int(t)) if isinstance(t, (int, float)) else datetime.now(UTC)
         vol = float(position.volume)
         self.tracked[str(int(position.ticket))] = {
             "ticket": int(position.ticket), "kind": kind, "side": side or ("LONG" if int(getattr(position, "type", 0)) == 0 else "SHORT"),
@@ -192,12 +193,23 @@ class PositionManager:
         self._save()
         return closed_records
 
+    def _card_context(self, rec: dict[str, Any]) -> dict[str, Any]:
+        """Realised P/L so far, remaining volume and the live SL — what every management card must show (v3.3.0)."""
+        current = self._position(rec["ticket"])
+        plan = rec.get("plan") or {}
+        return {"side": rec.get("side"), "session": rec.get("session"), "entry": rec.get("open_price"),
+                "realized_pnl": round(float(rec.get("realized", 0.0) or 0.0), 2),
+                "remaining_volume": round(float(current.volume) if current else 0.0, 2),
+                "original_volume": rec.get("original_volume"), "sl": rec.get("sl"),
+                "take_profits": plan.get("take_profits", []), "actual_rr": plan.get("actual_rr", []),
+                "setup_id": rec.get("setup_id")}
+
     def _close_full(self, rec: dict[str, Any], reason: str, price: float, extra: dict[str, Any]) -> None:
         result = self.client.close_position(rec["ticket"], self.config.magic.pa)
         absent = self._position(rec["ticket"]) is None
         confirmed = bool(result.success and absent)
         self.audit("pa_close", {"ticket": rec["ticket"], "reason": reason, "success": confirmed, "retcode": result.retcode,
-                                "message": result.message, **extra})
+                                "message": result.message, **self._card_context(rec), **extra})
         if confirmed:
             rec["exit_reason_hint"] = reason
             self.pending_finalize[str(rec["ticket"])] = self.tracked.pop(str(rec["ticket"]))
@@ -235,7 +247,8 @@ class PositionManager:
             self.audit(kind, {"ticket": rec["ticket"], "success": False, "message": "SL violates stop/freeze or side", "sl": sl}); return False
         result = self.client.modify_sltp(rec["ticket"], sl, tp, self.config.magic.pa)
         after = self._position(rec["ticket"]); ok = bool(result.success and after and abs(float(after.sl) - sl) <= max(float(getattr(info, "point", .01)), 1e-9))
-        self.audit(kind, {"ticket": rec["ticket"], "sl": sl, "tp": tp, "success": ok, "retcode": result.retcode, "message": result.message})
+        self.audit(kind, {"ticket": rec["ticket"], "sl": sl, "new_sl": sl, "previous_sl": rec.get("sl"), "tp": tp, "success": ok,
+                          "retcode": result.retcode, "message": result.message, **self._card_context(rec)})
         if ok: rec["sl"] = sl; rec["final_sl"] = sl; rec["tp"] = tp
         return ok
 
@@ -249,7 +262,8 @@ class PositionManager:
         ok = bool(result.success and closed + 1e-9 >= volume and closed <= volume + float(self.client.symbol_info(self.config.symbol).volume_step) / 2)
         deals = self._sync_deals(rec)
         self.audit("pa_partial", {"ticket": rec["ticket"], "label": label, "requested_volume": volume, "confirmed_volume": closed,
-                                  "success": ok, "retcode": result.retcode, "message": result.message})
+                                  "success": ok, "retcode": result.retcode, "message": result.message,
+                                  "exit_price": (deals[-1].get("price") if deals else None), **self._card_context(rec)})
         if ok:
             matching = deals[-1] if deals else {}
             rec["partial_exits"].append({"label": label, "volume": closed, "price": matching.get("price"), "net": matching.get("net")})

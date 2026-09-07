@@ -34,7 +34,7 @@ def cli() -> int:
     discord = Discord(integ.discord_webhook_env, integ.discord_min_interval_seconds,
                       config.reporting.discord_scout_pair_min_interval_seconds,
                       integ.discord_retry_count, integ.discord_retry_backoff_seconds,
-                      integ.discord_status_mode, integ.discord_event_level)
+                      integ.discord_status_mode, integ.discord_event_level, config.display_timezone)
     sink = FirestoreSink(integ.firebase_key_path, integ.firestore_push_seconds, integ.series_sample_seconds,
                          integ.firestore_series_max_points)
     telemetry = Telemetry(flush_seconds=integ.telemetry_flush_seconds)
@@ -89,7 +89,7 @@ def cli() -> int:
     logger.event = fanout
     client = MT5Client(mt5_terminal_path(), config.safety.deal_history_max_days, symbol=config.symbol,
                        tick_max_age_seconds=config.safety.broker_market_stale_seconds,
-                       broker_timestamp_offset_seconds=config.safety.broker_timestamp_offset_seconds)
+                       broker_utc_offset_hours=config.safety.manual_broker_offset_hours)   # v3.3.0: None = auto-detect
     try:
         validation = client.initialize()                                            # attach to the logged-in terminal; no credentials
     except Exception as exc:
@@ -134,6 +134,7 @@ def cli() -> int:
                                                                   "firestore_enabled": sink.enabled(), "firestore_error": sink.last_error,
                                                                   "calibration_status": snapshot.reporting.get("calibration_status"),
                                                                   "signal_go": snapshot.go_status, "target_verdict": snapshot.analysis.get("session_target", {}).get("target_verdict")})
+                telemetry.record_broker_clock(engine.broker_clock())                        # v3.3.0: offset visible in heartbeat.json
                 cycle_seconds = time.time() - t0
                 if cycle_seconds > config.poll_seconds:                                    # v1.9.0: visible when a cycle overruns the poll
                     logger.event("cycle_slow", {"cycle_seconds": round(cycle_seconds, 2), "poll_seconds": config.poll_seconds,

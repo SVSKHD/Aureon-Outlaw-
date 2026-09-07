@@ -28,7 +28,12 @@ def main():
         rates = mt5.copy_rates_from_pos(args.symbol, mt5.TIMEFRAME_M1, 0, 2)
         print(json.dumps(dict(samples=samples, raw_m1_open_times=[] if rates is None else
               [datetime.fromtimestamp(int(r['time']), UTC).isoformat() for r in rates]), indent=2))
-        print('Verify Windows UTC independently. Standard MT5 timestamps are UTC. Do not infer an offset from one stale tick.')
+        deltas = [s['tick_minus_system_seconds'] for s in samples]
+        detected = round(sum(deltas) / len(deltas) / 1800) * 0.5
+        print(f'Detected broker offset would be UTC{detected:+g}h (nearest 30 min over {len(deltas)} samples); '
+              f'residual {sum(deltas) / len(deltas) - detected * 3600:+.1f}s.')
+        print('The bot detects this itself at startup (safety.broker_utc_offset_hours: null). Verify Windows UTC '
+              'independently: a residual of more than a few seconds is the PC clock, not the broker timezone.')
     finally:
         mt5.shutdown()
 

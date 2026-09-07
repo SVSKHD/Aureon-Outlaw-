@@ -20,9 +20,22 @@ def client(monkeypatch, offset=0, age=-10800):
     return adapter.MT5Client(broker_timestamp_offset_seconds=offset)
 
 
-def test_future_tick_rejected_without_guessing_offset(monkeypatch):
+def test_off_grid_future_tick_is_rejected_not_guessed_as_a_timezone(monkeypatch):
+    """v3.3.0 changes this case deliberately.
+
+    A difference that sits on the half-hour grid every MT5 server timezone lives on IS detected
+    (that is the whole point of the auto-detection: a UTC+3 server must not block the bot for ever).
+    A difference that does not — a broken PC clock — is still refused rather than absorbed into an
+    invented offset, which is what this test was written to protect.
+    """
     with pytest.raises(RuntimeError, match='future'):
-        client(monkeypatch).validate_terminal()
+        client(monkeypatch, age=-1500).validate_terminal()          # 25 minutes ahead: not a timezone
+
+    detected = client(monkeypatch, age=-10800)                       # exactly 3 hours: a real UTC+3 server
+    validation = detected.validate_terminal()
+    assert validation['broker_utc_offset_hours'] == 3.0
+    assert validation['broker_clock_source'] == 'auto'
+    assert abs(validation['tick_age_seconds']) < 2
 
 
 def test_verified_offset_normalizes_ticks_bars_and_startup(monkeypatch):

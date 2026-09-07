@@ -92,8 +92,9 @@ def test_discord_commands_answer_from_bot_files(tmp_path):
     state = BotState(tmp_path)
     status = dispatch(state, "!status")
     assert isinstance(status, dict) and "WAIT / NO MANUAL ENTRY" in status["title"]
-    fields = {f["name"]: f["value"] for f in status["fields"]}
+    fields = {f["name"]: f["value"] for f in status["fields"]}                       # v3.3.0: look fields up by name
     assert "COUPLED" in fields["Silver"] and "UNAVAILABLE" in fields["Fakeout assessment"]
+    assert fields["Verdict"] and fields["Blocked by"] and fields["Broker clock"]      # v3.3.0 gate table + clock
     text = dispatch(state, "!text")
     assert text.startswith("**[") and "Silver: COUPLED" in text
     det = dispatch(state, "!detected")
