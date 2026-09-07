@@ -100,7 +100,7 @@ The supervisor now anchors its child process, heartbeat, config and `PYTHONPATH`
 
 Complete every item in `FORWARD_TEST_CHECKLIST.md` before relying on the system for manual funded decisions.
 
-## Discord command bot (v3.1.0)
+## Discord command bot (v3.1.0, commands extended in v3.3.0)
 
 1. Discord Developer Portal → New Application → Bot → Reset Token → paste into `.env` as `DISCORD_BOT_TOKEN`.
 2. Bot → Privileged Gateway Intents → enable **Message Content Intent**.
@@ -108,3 +108,30 @@ Complete every item in `FORWARD_TEST_CHECKLIST.md` before relying on the system 
 4. Optional: right-click the channel → Copy Channel ID → `.env` `DISCORD_COMMAND_CHANNEL_ID=`.
 5. `pip install -e ".[discord]"` in the same venv, then run `run_discord_bot.bat` (second Task Scheduler entry, At log on).
 6. Type `!help` in the channel. The bot only reads files; if `!status` says the snapshot is old, check `!heartbeat`.
+
+## Broker server time (v3.3.0)
+
+MetaTrader 5 reports tick and bar times in **its server's** timezone, which is usually not UTC —
+UTC+2/UTC+3 is the common broker setting. The bot detects that offset from the terminal itself at
+startup, re-measures it at most once an hour and on every reconnect, and converts every tick, bar and
+deal time to UTC before anything else looks at them.
+
+* **Nothing to configure.** `safety.broker_utc_offset_hours: null` means auto-detect.
+* Pin it only if you have a reason to: `broker_utc_offset_hours: 3` for a UTC+3 server (whole or half
+  hours). A pinned value that disagrees with the server shows up as residual skew and blocks orders,
+  so a wrong value is never silent.
+* `safety.max_clock_skew_seconds` (default 600) applies to the **residual** skew after the offset —
+  i.e. to a genuinely wrong Windows clock. If orders are blocked with
+  `broker clock skew … (residual after broker offset …)`, fix the PC clock:
+  **Settings → Time & language → Date & time → Set time automatically**, then **Sync now**.
+* Check it any time from Discord with `!clock` (system UTC, broker time, detected offset, residual
+  skew, guard status), or in `data/heartbeat.json` (`broker_utc_offset_hours`).
+
+## Reading a NO-GO (v3.3.0)
+
+* `!why` (or `!decide`) prints every router gate for the latest cycle — PASS/FAIL, the value, the
+  threshold — followed by what would flip each failed gate and the strongest evidence per side.
+* The same trace appears in the console under `DECISION TRACE`, and on the `!status` card as
+  **Verdict**, **Blocked by** and **Next**.
+* GO means the cycle's demo setup passed every gate. It is a signal and a session GO tally, never a
+  standing instruction to place an order.

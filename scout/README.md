@@ -105,11 +105,35 @@ Conservative extension points (not claimed as production-calibrated):
 
 See `EXAMPLE_REPORTS.md` for LONG, SHORT, WAIT and active-position output examples.
 
+## v3.3.0 — broker clock offset + a readable decision (Sep 7 2026)
+
+- **Root cause of "scouts are never placed"**: MT5 reports tick and bar times in the BROKER SERVER
+  timezone. A UTC+3 server therefore looked like a permanent 10 799 s clock skew, and the clock guard
+  blocked every order. `mt5_client.BrokerClock` now detects that offset (nearest 30 min, re-measured
+  hourly and on reconnect, DST steps only after the first detection) and applies it to every tick,
+  bar and deal time, so the rest of the bot works in true UTC. The guard acts on the RESIDUAL skew,
+  which is the real fault. `safety.broker_utc_offset_hours: null` auto-detects; a whole/half-hour
+  value pins it.
+- **The decision explains itself**: `snapshot.analysis.decision_trace` carries a one-sentence verdict,
+  all 17 router gates in order with value/threshold, what would flip each failed gate, and the three
+  strongest confluence families per side. Printed every cycle, on the status card
+  (Verdict / Blocked by / Next), and in SQLite/Firestore.
+- **Cards tell the whole story**: SCOUTS NOT PLACED maps the reason text to a concrete fix and shows
+  the detected offset, attempt number and next retry; PLACED/ROLLED BACK/CLOSED/ADOPTED carry both
+  tickets, entries, P/L, MFE/MAE and verdict strength; a real ORDER PLACED card now exists (the event
+  was listed but never emitted); management cards show realised P/L, remaining volume and the new SL;
+  the Detected card collapses `ROUND_1 ×N` and shows zone distance in ATR.
+- **New read-only commands**: `!why` (alias `!decide`) full gate table, `!clock` broker time and offset.
+  Still no order commands, by design.
+- Fixed a Python 3.11 f-string syntax error in `cards.py` / `discord_bot.py` that made the package
+  unimportable on the supported runtime. Added `.gitignore`; `__pycache__` is no longer committed.
+- 263 passing tests. See `RELEASE_NOTES_v3.3.0.md`.
+
 ## v3.1.0 — silver correlation + Discord commands (Sep 6 2026)
 
 - `intermarket.py`: XAU/XAG rolling correlation, relative strength and M15 SMT divergence as a capped (8-point) confluence family,
   active only while the metals are COUPLED (r ≥ 0.50). Evidence only; degrades to UNAVAILABLE without blocking a cycle.
-- `discord_bot.py` + `run_discord_bot.bat`: read-only command bot (`!status !plan !silver !scouts !positions !day !trades !go
+- `discord_bot.py` + `run_discord_bot.bat`: read-only command bot (`!status !why !clock !detected !plan !silver !scouts !positions !day !trades !go
   !events !reports !heartbeat`). Needs `DISCORD_BOT_TOKEN` in `.env`, `pip install -e ".[discord]"`, Message Content Intent on.
 - 212 passing tests. See `RELEASE_NOTES_v3.1.0.md`.
 
