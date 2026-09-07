@@ -4,6 +4,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import time
+
 import pandas as pd
 
 from .candles import detect_candlestick_patterns
@@ -105,12 +107,17 @@ class TradingEngine:
         """Gate for every order: broker clock sane, market open, account safe, tick fresh."""
         if not self.clock_ok:
             return False, (f"broker clock skew {self.clock_skew:.0f}s > {self.config.safety.max_clock_skew_seconds}s "
-                           f"(residual after broker offset {self.broker_offset_hours:+.1f}h)")
+                           f"(residual after broker offset {self.broker_offset_hours:+.1f}h); "
+                           "sync the Windows clock and verify the feed timestamps")
         now = getattr(self, "cycle_now", None) or datetime.now(UTC)
+        if hasattr(self, "_cycle_monotonic"):
+            now += timedelta(seconds=max(0.0, time.monotonic() - self._cycle_monotonic))
         if not self.sessions.calendar_open(now):
             return False, "market closed by weekend/holiday/early-close calendar"
         try:
             tick = self.client.get_tick(self.config.symbol)
+            if (tick.time - now).total_seconds() > 5:
+                return False, "tick is in the future — sync Windows clock / verify broker timestamps"
             if (now - tick.time).total_seconds() > self.config.safety.broker_market_stale_seconds:
                 return False, "no fresh tick — market closed or feed down"
         except Exception as exc:
@@ -404,7 +411,9 @@ class TradingEngine:
         self.broker_offset_hours = float(getattr(clock, "offset_hours", 0.0) or 0.0)
         self.broker_clock_source = str(getattr(clock, "source", "assumed_utc"))
         self.clock_skew = (tick.time - now).total_seconds()
-        ok = abs(self.clock_skew) <= self.config.safety.max_clock_skew_seconds or not self.sessions.calendar_open(now)
+        # Asymmetric on purpose (from the manual-offset fix on master): once the server timezone has
+        # been removed, a tick in the FUTURE is never legitimate, while a small lag always is.
+        ok = -self.config.safety.max_clock_skew_seconds <= self.clock_skew <= 5 or not self.sessions.calendar_open(now)
         if self._last_offset_reported != self.broker_offset_hours:                          # once per detected offset
             self._last_offset_reported = self.broker_offset_hours
             self.logger.event("broker_clock_offset", {
@@ -593,6 +602,7 @@ class TradingEngine:
     def run_cycle(self, now: datetime | None = None) -> AnalysisSnapshot:
         now = (now or datetime.now(UTC)).astimezone(UTC)
         self.cycle_now = now
+        self._cycle_monotonic = time.monotonic()
         self.cycle_tdate = self.sessions.broker_trading_date(now)                    # v2.2.0 item 4: known before any event of this cycle
         self._validate_clock(now)                                                     # 3. before any order
         if self.last_cycle is None:
@@ -837,6 +847,7 @@ class TradingEngine:
             except Exception as exc:
                 self.logger.event("setup_outcome_error", {"stage": "register", "error": str(exc)})
         snapshot.analysis = {
+            "clock": {"ok": self.clock_ok, "tick_minus_system_seconds": self.clock_skew},
             "multi_timeframe": mtf, "treatment": treat, "session_target": target, "historical_pattern_reliability": rel,
             "live_scout_evidence": {"leader": scout.leader, "strength": scout.strength, "verdict": scout.verdict.value,
                                     "buy_pnl": scout.buy_pnl, "sell_pnl": scout.sell_pnl, "market_speed": scout.market_speed,
@@ -859,7 +870,7 @@ class TradingEngine:
                 decision = Decision(Action.NO_TRADE, f"Order withheld at send: {recheck_why}", now)
                 snapshot.decision = decision
                 self.logger.event("order_withheld", {"reason": recheck_why, "setup_id": setup_id})
-        if plan is not None and decision.action.value in {"LONG", "SHORT"}:
+        if self.config.safety.allow_pa_orders and plan is not None and decision.action.value in {"LONG", "SHORT"}:
             result = execute_pa_trade(self.client, self.config, decision, plan, self.logger.event)            # 9-13. sizing, order_check, retry, verify
             self.logger.order("PA", result, {"decision": decision, "plan": plan, "result": result, "setup_id": setup_id})
             if result.success:

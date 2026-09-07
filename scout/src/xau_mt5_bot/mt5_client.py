@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - expected on non-Windows test systems
 
 
 OFFSET_QUANTUM_SECONDS = 1800          # broker server timezones are whole or half hours
+OFFSET_TOLERANCE_SECONDS = 120         # how close to that grid a difference must be to BE a timezone
 REMEASURE_SECONDS = 3600               # v3.3.0: re-detect the offset at most once per hour
 
 
@@ -75,17 +76,19 @@ class BrokerClock:
     def measure(self, epoch: float, now: datetime, server: str = "") -> "BrokerClock":
         """Detect (or, when manual, only verify) the offset from one tick.
 
-        The FIRST measurement rounds the broker-minus-system difference to the nearest 30 minutes,
-        which is what a server timezone always is. Later measurements do NOT re-round: once the
-        timezone is known, the only legitimate change is a DST step — a whole number of hours that
-        leaves almost nothing behind. Anything else is a real clock fault and must show up as
-        residual skew instead of being quietly absorbed into a new "timezone".
+        An offset is adopted ONLY when the broker-minus-system difference sits within
+        OFFSET_TOLERANCE_SECONDS of the half-hour grid every MT5 server timezone lives on. A broken
+        PC clock produces an arbitrary difference, which is therefore never mistaken for a timezone:
+        it stays visible as residual skew and blocks orders. After the first detection the offset
+        moves only for a DST step — a whole number of hours that leaves almost nothing behind.
         """
         delta = (self.broker_wall_clock(epoch) - now.astimezone(UTC)).total_seconds()
         if not self.manual:
             candidate = round(delta / OFFSET_QUANTUM_SECONDS) * OFFSET_QUANTUM_SECONDS
+            on_grid = abs(delta - candidate) <= OFFSET_TOLERANCE_SECONDS
             step = candidate - self.offset.total_seconds()
-            if self.measured_at is None or (step and step % 3600 == 0 and abs(delta - candidate) < 60):
+            first = self.measured_at is None
+            if on_grid and (first or (step and step % 3600 == 0 and abs(delta - candidate) < 60)):
                 self.offset = timedelta(seconds=candidate)
         self.residual_seconds = round(delta - self.offset.total_seconds(), 3)
         self.measured_at = now.astimezone(UTC)
@@ -100,15 +103,19 @@ class BrokerClock:
                 "broker_clock_measured_at": self.measured_at.isoformat() if self.measured_at else None}
 
 
-def broker_epoch_to_utc(client: Any, epoch: float) -> datetime:
+def broker_epoch_to_utc(client: Any, epoch: float, *, already_utc: bool | None = None) -> datetime:
     """Convert a raw MT5 epoch through the client's broker clock wherever one is available.
 
     Modules that read epoch fields straight off an MT5 structure (position.time, deal.time)
     call this instead of `datetime.fromtimestamp(t, tz=UTC)` so there is exactly one
-    conversion rule in the process.
+    conversion rule in the process. A client that already normalises those fields on the way out
+    (MT5Client.positions) advertises `positions_are_utc`, and the epoch is then taken as-is —
+    converting twice would be worse than not converting at all.
     """
+    if already_utc is None:
+        already_utc = bool(getattr(client, "positions_are_utc", False))
     clock = getattr(client, "clock", None)
-    if isinstance(clock, BrokerClock):
+    if not already_utc and isinstance(clock, BrokerClock):
         return clock.to_utc(epoch)
     return datetime.fromtimestamp(float(epoch), tz=UTC)
 
@@ -170,14 +177,18 @@ class MT5Client:
     TIMEFRAMES: dict[str, int] = {}
 
     def __init__(self, terminal_path: str | None = None, deal_history_max_days: int = 3650, symbol: str = "XAUUSD",
-                 tick_max_age_seconds: int = 120, broker_utc_offset_hours: float | None = None) -> None:
+                 tick_max_age_seconds: int = 120, broker_utc_offset_hours: float | None = None,
+                 broker_timestamp_offset_seconds: int | None = None) -> None:
         if mt5 is None:
             raise RuntimeError("MetaTrader5 package is unavailable; run this bot on Windows with MT5")
         self.terminal_path = terminal_path or None
         self.deal_history_max_days = deal_history_max_days
         self.symbol = symbol
         self.tick_max_age_seconds = tick_max_age_seconds
+        if broker_utc_offset_hours is None and broker_timestamp_offset_seconds:
+            broker_utc_offset_hours = broker_timestamp_offset_seconds / 3600.0   # legacy seconds form
         self.clock = BrokerClock.from_hours(broker_utc_offset_hours)     # v3.3.0: broker-server time → true UTC
+        self.positions_are_utc = True                                    # positions() below already converts
         self.validation: dict[str, Any] = {}
         self.TIMEFRAMES = {
             "M1": mt5.TIMEFRAME_M1,
@@ -218,7 +229,12 @@ class MT5Client:
         if tick is None: raise RuntimeError(f"No tick for {self.symbol}: {mt5.last_error()}")
         # v3.3.0: detect the broker timezone FIRST — otherwise a UTC+3 server looks like a 3-hour-stale tick.
         self.clock.measure(tick.time, datetime.now(UTC), str(getattr(account, "server", "")))
-        age = (datetime.now(UTC) - self.clock.to_utc(tick.time)).total_seconds()
+        age = (datetime.now(UTC) - self.timestamp_utc(tick.time)).total_seconds()
+        if age < -5:
+            # After the server timezone has been removed, a tick still in the future is a real fault.
+            raise RuntimeError(f"{self.symbol} tick is {-age:.0f}s in the future even after the detected broker offset "
+                               f"(UTC{self.clock.offset_hours:+g}h); sync the Windows clock first. Pin the server timezone with "
+                               "safety.broker_utc_offset_hours only when it is verified; do not widen the clock limit")
         if age > self.tick_max_age_seconds: raise RuntimeError(f"{self.symbol} tick is stale ({age:.0f}s old)")
         if float(info.volume_min) <= 0 or float(info.volume_step) <= 0 or float(info.volume_max) < float(info.volume_min):
             raise RuntimeError(f"Invalid volume constraints for {self.symbol}")
@@ -230,6 +246,7 @@ class MT5Client:
             "volume_min": float(info.volume_min), "volume_step": float(info.volume_step), "volume_max": float(info.volume_max),
             "terminal_path": self.terminal_path, "validated_at": datetime.now(UTC).isoformat(),
             **self.clock.payload(),
+            "broker_timestamp_offset_seconds": int(self.clock.offset.total_seconds()),      # legacy key, same value
         }
         return self.validation
 
@@ -274,13 +291,17 @@ class MT5Client:
             epoch = value.time
         return self.clock.measure(epoch, now)
 
+    def timestamp_utc(self, value: float) -> datetime:
+        """Any raw MT5 epoch → true UTC, through the one broker clock."""
+        return self.clock.to_utc(value)
+
     def get_tick(self, symbol: str) -> Tick:
         self.ensure_symbol(symbol)
         value = mt5.symbol_info_tick(symbol)
         if value is None:
             raise RuntimeError(f"No live tick for {symbol}: {mt5.last_error()}")
         self.refresh_broker_clock(value.time)
-        return Tick(self.clock.to_utc(value.time), float(value.bid), float(value.ask))
+        return Tick(self.timestamp_utc(value.time), float(value.bid), float(value.ask))
 
     def get_bars(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
         self.ensure_symbol(symbol)
@@ -314,6 +335,19 @@ class MT5Client:
     def positions(self, symbol: str | None = None, magic: int | None = None) -> list[Any]:
         values = mt5.positions_get(symbol=symbol) if symbol else mt5.positions_get()
         items = list(values or [])
+        offset = int(self.clock.offset.total_seconds())
+        if offset:
+            # Broker-server epochs on the position itself, normalised to UTC here (never mutating the
+            # broker's own object). `positions_are_utc` tells broker_epoch_to_utc() not to convert again.
+            from types import SimpleNamespace
+            normalized = []
+            for position in items:
+                data = position._asdict() if hasattr(position, "_asdict") else vars(position).copy()
+                for key in ("time", "time_update", "time_msc", "time_update_msc"):
+                    if data.get(key):
+                        data[key] -= offset * (1000 if key.endswith("msc") else 1)
+                normalized.append(SimpleNamespace(**data))
+            items = normalized
         if magic is not None:
             items = [position for position in items if int(position.magic) == magic]
         return items
@@ -402,7 +436,7 @@ class MT5Client:
         reasons = {getattr(mt5, "DEAL_REASON_SL", 4): "SL", getattr(mt5, "DEAL_REASON_TP", 5): "TP", getattr(mt5, "DEAL_REASON_SO", 6): "STOP_OUT",
                    getattr(mt5, "DEAL_REASON_EXPERT", 3): "BOT", getattr(mt5, "DEAL_REASON_CLIENT", 0): "MANUAL"}
         return {"price": float(d.price), "profit": float(d.profit) + float(getattr(d, "commission", 0)) + float(getattr(d, "swap", 0)),
-                "time": self.clock.to_utc(int(d.time)), "reason": reasons.get(int(d.reason), str(d.reason)), "volume": float(d.volume)}
+                "time": self.timestamp_utc(d.time), "reason": reasons.get(int(d.reason), str(d.reason)), "volume": float(d.volume)}
 
     def closed_deals(self, position_ticket: int, opened_at: datetime | None = None) -> list[dict]:
         """All exit deals for a position, including partial exits and costs."""
@@ -421,7 +455,7 @@ class MT5Client:
             out.append({"deal_ticket": int(d.ticket), "price": float(d.price), "profit": float(d.profit),
                         "commission": float(getattr(d, "commission", 0)), "swap": float(getattr(d, "swap", 0)),
                         "net": float(d.profit) + float(getattr(d, "commission", 0)) + float(getattr(d, "swap", 0)),
-                        "time": self.clock.to_utc(int(d.time)), "reason": reasons.get(int(d.reason), str(d.reason)),
+                        "time": self.timestamp_utc(d.time), "reason": reasons.get(int(d.reason), str(d.reason)),
                         "volume": float(d.volume)})
         return out
 

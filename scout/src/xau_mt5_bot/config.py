@@ -56,8 +56,12 @@ class SafetyConfig(BaseModel):
     one_pa_position_per_symbol: bool = True
     max_m1_age_seconds: int = Field(default=300, ge=60)
     retry_count: int = Field(default=1, ge=0, le=3)
+    # v3.3.0: null = auto-detect the MT5 server timezone from its own ticks. A number pins it
+    # (whole or half hours). broker_timestamp_offset_seconds is the older manual-only form and is
+    # still honoured when the hours override is null; the hours override wins when both are set.
+    broker_utc_offset_hours: float | None = Field(default=None, ge=-14, le=14)
+    broker_timestamp_offset_seconds: int = Field(default=0, ge=-50400, le=50400)
     max_clock_skew_seconds: int = Field(default=600, ge=60)   # residual skew AFTER the broker offset is applied
-    broker_utc_offset_hours: float | None = Field(default=None, ge=-14, le=14)   # null = auto-detect (v3.3.0)
     transition_retry_limit: int = Field(default=5, ge=0)
     repair_missing_scout_leg: bool = True
     scout_repair_max_session_fraction: float = Field(default=0.5, ge=0, le=1)
@@ -71,6 +75,15 @@ class SafetyConfig(BaseModel):
         if self.broker_utc_offset_hours is not None and abs(self.broker_utc_offset_hours * 2 - round(self.broker_utc_offset_hours * 2)) > 1e-9:
             raise ValueError("safety.broker_utc_offset_hours must be a whole or half hour (e.g. 3, 2.5, -5), or null to auto-detect")
         return self
+
+    @property
+    def manual_broker_offset_hours(self) -> float | None:
+        """The effective manual override: the hours key, else the legacy seconds key, else None (auto-detect)."""
+        if self.broker_utc_offset_hours is not None:
+            return float(self.broker_utc_offset_hours)
+        if self.broker_timestamp_offset_seconds:
+            return self.broker_timestamp_offset_seconds / 3600.0
+        return None
 
 
 class MagicConfig(BaseModel):
@@ -155,7 +168,7 @@ class IntegrationsConfig(BaseModel):
     discord_min_interval_seconds: int = 300
     # v3.1.1 — status pushes: "events" = never push the status block (use !status), "changes" = only when the
     # decision/entry-state/PA side/session changes, "interval" = changes + one status every discord_min_interval_seconds.
-    discord_status_mode: str = Field(default="events", pattern="^(events|changes|interval)$")
+    discord_status_mode: str = Field(default="hourly", pattern="^(events|changes|interval|hourly|off)$")
     # v3.1.1 — event set: "trade" = lifecycle + risk events only; "all" = every eligible audit event (v3.0 behaviour).
     discord_event_level: str = Field(default="trade", pattern="^(trade|all)$")
     firebase_key_path: str = "serviceAccountKey.json"
