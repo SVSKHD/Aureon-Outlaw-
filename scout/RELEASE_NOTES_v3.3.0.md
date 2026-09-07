@@ -86,8 +86,8 @@ root. Two nested same-quote f-strings that only parse on Python 3.12+ were rewri
 `env.example` was restored to `.env.example`.
 
 ## Verification (Linux, Python 3.11)
-- 241 tests collected, all pass (216 pre-existing + 25 new).
-- New: `tests/test_v33_broker_clock.py` (14). Extended: `tests/test_v31_discord_bot.py` (+11).
+- 240 tests collected, all pass: 215 pre-existing (unchanged), +15 broker clock, +10 Discord cards.
+- New: `tests/test_v33_broker_clock.py` (15 tests). Extended: `tests/test_v31_discord_bot.py` (9 → 19).
 - Covered: +3 h offset detected with residual < 5 s and scouts opening; a 25-minute genuine skew after the offset still
   blocking with the clock message; bar times converted so `session_at()` and freshness are right; a manual override
   winning over auto-detection and never being replaced; hourly / on-reconnect re-measurement; and a source audit that

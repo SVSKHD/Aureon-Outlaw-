@@ -131,7 +131,7 @@ three hours into the future, which also broke session attribution, freshness, sw
 - The Detected card collapses ROUND_1 sweeps (`ROUND_1 ×3 (4407.00–4409.00)`), dedupes identical level+price, keeps the
   6 newest sweeps and 2 newest structure events per timeframe, and shows zone distance in ATR.
 - Repository layout fixed to the src-layout `pyproject.toml` already described (`src/xau_mt5_bot/`, `tests/`).
-- 241 passing tests. See `RELEASE_NOTES_v3.3.0.md`.
+- 240 passing tests. See `RELEASE_NOTES_v3.3.0.md`.
 
 ## v3.1.0 — silver correlation + Discord commands (Sep 6 2026)
 
