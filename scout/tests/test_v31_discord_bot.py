@@ -347,3 +347,19 @@ def test_no_order_commands_were_added():
     for cmd in ("buy", "sell", "close", "long", "short", "open", "modify"):
         reply = dispatch(BotState(ROOT), f"!{cmd}")
         assert "not implemented by design" in reply
+
+
+def test_scout_lifecycle_and_clock_events_post_on_the_quiet_default(monkeypatch):
+    from xau_mt5_bot.notify import Discord
+    d = Discord("NOPE", 0, 0); d.url = "https://example.invalid/hook"; sent = []
+    monkeypatch.setattr(d, "send", lambda text="", embed=None: sent.append(embed or text) or True)
+    assert d.event_level == "trade"
+    for kind in ("scout_session_open", "scout_session_close", "scout_rollback", "scout_adopted", "scout_open_failed"):
+        assert d.event(kind, {"session": kind.upper()}) is True, kind
+    assert d.event("broker_clock_offset", {"offset_hours": 3.0, "residual_skew_seconds": 0.2,
+                                           "max_clock_skew_seconds": 600, "server": "Broker-Demo03",
+                                           "message": "Broker server clock is UTC+3"}) is True
+    assert d.event("clock_check", {}) is False                      # still quiet: the offset card replaces it
+    clock_card = sent[-1]
+    assert clock_card["title"] == "🕰️ BROKER CLOCK · UTC+3"
+    assert "Broker-Demo03" in json.dumps(clock_card)

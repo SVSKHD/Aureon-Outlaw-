@@ -17,7 +17,9 @@ class Discord:
                    "session_transition", "session_summary", "weekly_report", "next_week_open_report",
                    "scout_session_open", "scout_session_close", "scout_rollback", "scout_stale_pair_closed",
                    "order", "order_withheld", "pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close", "trade_closed",
-                   "strong_scout_contradiction", "smt_divergence", "state_file_recovered", "scout_open_failed"})               # v3.1.1: quiet default
+                   "strong_scout_contradiction", "smt_divergence", "state_file_recovered", "scout_open_failed",
+                   # v3.3.0: restart adoption and a changed broker clock offset are both rare and operationally important
+                   "scout_adopted", "scout_leg_repaired", "broker_clock_offset"})                                    # v3.1.1: quiet default
 
     def __init__(self, webhook_env: str, min_interval: int = 300, scout_pair_min_interval: int = 60,
                  retry_count: int = 3, retry_backoff_seconds: float = 1.0,
