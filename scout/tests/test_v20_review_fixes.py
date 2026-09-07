@@ -230,6 +230,8 @@ def test_session_summary_preserves_go_that_applied(config, tmp_path: Path):
 def test_firestore_schema_version_matches_contract():
     contract = json.loads((Path(__file__).resolve().parents[1] / "FIRESTORE_SCHEMA.json").read_text())
     assert FirestoreSink.SCHEMA_VERSION == contract["version"] == "3.3.0"
+    price = contract["collections"]["sessions"]["price_required"]
+    assert "broker_utc_offset_hours" in price                     # v3.3.0: the offset removed from every time in the doc
 
 
 class _Doc:

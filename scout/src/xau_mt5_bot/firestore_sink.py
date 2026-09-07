@@ -54,7 +54,8 @@ class FirestoreSink:
             "schema_version": self.SCHEMA_VERSION,
             "date": None, "session": s.session.value, "symbol": s.symbol, "updated_ts": datetime.now(UTC),
             "price": {"bid": s.bid, "ask": s.ask, "spread": s.spread, "freshness": s.freshness.value,
-                      "broker_utc_offset_hours": (getattr(s, "analysis", {}).get("broker_clock") or {}).get("broker_utc_offset_hours")},
+                      # v3.3.0: broker-server clock offset removed from every tick/bar time in this document
+                      "broker_utc_offset_hours": (s.analysis.get("broker_clock") or {}).get("offset_hours")},
             "structure": {tf: r.state.value for tf, r in s.structures.items()},
             "pa": {"side": s.pa_side.value if s.pa_side else None, "confluence": s.confluence, "entry_state": s.entry_state.value,
                    "zone": {"lo": zone.low, "hi": zone.high, "kind": zone.kind} if zone else None,

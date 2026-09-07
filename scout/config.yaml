@@ -22,6 +22,7 @@ safety:
   # Legacy manual-only form of the broker offset, in seconds. Kept for compatibility and honoured
   # only when broker_utc_offset_hours below is null; 0 means "use auto-detection".
   broker_timestamp_offset_seconds: 0
+  broker_offset_remeasure_seconds: 3600   # re-detect the server timezone at most this often
   allow_scout_orders: true      # session scout pairs on DEMO
   allow_pa_orders: false         # manual entries; demo scouts still enabled
   allow_live_account: false     # hard stop: never a live account

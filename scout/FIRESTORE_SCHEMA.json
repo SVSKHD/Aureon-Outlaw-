@@ -53,8 +53,9 @@
         "fakeout_risk",
         "remaining_session_minutes",
         "intermarket",
-        "decision_trace",
-        "broker_clock"
+        "broker_clock",
+        "router_vetoes",
+        "blocked_by"
       ],
       "decision_summary_fields": [
         "signal_go",
@@ -126,26 +127,20 @@
         "freshness",
         "broker_utc_offset_hours"
       ],
-      "decision_trace_fields": [
-        "verdict",
-        "action",
-        "reason",
-        "gates",
-        "blocked_by",
-        "passed_count",
-        "gate_count",
-        "next",
-        "evidence",
-        "go_meaning"
-      ],
       "broker_clock_fields": [
-        "broker_utc_offset_hours",
-        "broker_clock_residual_seconds",
-        "broker_clock_source",
-        "broker_server",
-        "residual_skew_seconds",
-        "clock_ok",
-        "max_clock_skew_seconds"
+        "offset_hours",
+        "offset_seconds",
+        "residual_seconds",
+        "raw_delta_seconds",
+        "source",
+        "server",
+        "measured_at"
+      ],
+      "veto_fields": [
+        "veto",
+        "active",
+        "detail",
+        "flips_when"
       ]
     },
     "days": {

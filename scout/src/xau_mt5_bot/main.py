@@ -34,7 +34,7 @@ def cli() -> int:
     discord = Discord(integ.discord_webhook_env, integ.discord_min_interval_seconds,
                       config.reporting.discord_scout_pair_min_interval_seconds,
                       integ.discord_retry_count, integ.discord_retry_backoff_seconds,
-                      integ.discord_status_mode, integ.discord_event_level, config.display_timezone)
+                      integ.discord_status_mode, integ.discord_event_level)
     sink = FirestoreSink(integ.firebase_key_path, integ.firestore_push_seconds, integ.series_sample_seconds,
                          integ.firestore_series_max_points)
     telemetry = Telemetry(flush_seconds=integ.telemetry_flush_seconds)
@@ -88,8 +88,8 @@ def cli() -> int:
             discord_box.put(_discord_then_mark, kind, payload, event_id)
     logger.event = fanout
     client = MT5Client(mt5_terminal_path(), config.safety.deal_history_max_days, symbol=config.symbol,
-                       tick_max_age_seconds=config.safety.broker_market_stale_seconds,
-                       broker_utc_offset_hours=config.safety.manual_broker_offset_hours)   # v3.3.0: None = auto-detect
+                       broker_utc_offset_hours=config.safety.broker_utc_offset_hours,
+                       offset_remeasure_seconds=config.safety.broker_offset_remeasure_seconds)
     try:
         validation = client.initialize()                                            # attach to the logged-in terminal; no credentials
     except Exception as exc:
@@ -127,6 +127,7 @@ def cli() -> int:
                 print(format_report(snapshot, config.display_timezone), flush=True)
                 discord_box.put(discord.on_snapshot, snapshot, config.display_timezone)
                 firestore_box.put(sink.on_snapshot, snapshot, tdate, first_cycle or engine.session_boundary_event)
+                telemetry.record_broker_clock(engine.broker_clock)                      # v3.3.0 → heartbeat.json
                 telemetry.record_cycle((time.time() - t0) * 1000, {"action": snapshot.decision.action.value, "session": snapshot.session.value,
                                                                   "freshness": snapshot.freshness.value, "spread": snapshot.spread,
                                                                   "confluence": snapshot.confluence, "market_speed": snapshot.scout.market_speed,
@@ -134,7 +135,6 @@ def cli() -> int:
                                                                   "firestore_enabled": sink.enabled(), "firestore_error": sink.last_error,
                                                                   "calibration_status": snapshot.reporting.get("calibration_status"),
                                                                   "signal_go": snapshot.go_status, "target_verdict": snapshot.analysis.get("session_target", {}).get("target_verdict")})
-                telemetry.record_broker_clock(engine.broker_clock())                        # v3.3.0: offset visible in heartbeat.json
                 cycle_seconds = time.time() - t0
                 if cycle_seconds > config.poll_seconds:                                    # v1.9.0: visible when a cycle overruns the poll
                     logger.event("cycle_slow", {"cycle_seconds": round(cycle_seconds, 2), "poll_seconds": config.poll_seconds,
@@ -151,6 +151,7 @@ def cli() -> int:
                     try:
                         client.reconnect()
                         from .history import reset_history_cache; reset_history_cache()
+                        engine.broker_clock = {}                      # v3.3.0: offset re-detected on the next cycle
                         engine.last_cycle = None                      # re-run bootstrap: adopt positions, re-validate clock
                         engine.startup_cycle = True
                         logger.event("restart", {"kind": "mt5_reconnect"}); consecutive_errors = 0

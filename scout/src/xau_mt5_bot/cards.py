@@ -1,4 +1,4 @@
-"""Discord embed cards (v3.2.0). One builder per card, all working on the snapshot JSON dict so the webhook path
+"""Discord embed cards (v3.3.0). One builder per card, all working on the snapshot JSON dict so the webhook path
 (dataclass → dict) and the command bot (SQLite payload → dict) render identical cards."""
 from __future__ import annotations
 
@@ -26,62 +26,40 @@ RETCODE_HINTS = {
     10021: "No prices — feed gap at open, retried",
 }
 
-
-# v3.3.0: the message text, not just the retcode, decides the Fix line. Ordered — first match wins.
+# v3.3.0: the failure text carries far more than a retcode, so map the reason itself. Ordered — first match wins.
 REASON_HINTS: tuple[tuple[str, str], ...] = (
-    ("clock skew", "The MT5 server clock and this PC disagree by more than the allowance AFTER the broker timezone "
-                   "offset was applied, so the offset is not the problem — the PC clock is. Enable automatic time "
-                   "sync on Windows (Settings → Time & language), or pin the server timezone with "
-                   "safety.broker_utc_offset_hours if the broker really did move."),
-    ("spread", "The spread was wider than risk.max_spread_price when the session opened — normal at the open. "
-               "The bot retries on the next cycle; no action needed unless it stays wide."),
-    ("margin", "Free margin does not cover two scout legs. Reduce risk.scout_lot, or close other positions on the account."),
-    ("not safe", "An execution-safety check failed (margin, volume budget or trade permission). "
-                 "Check risk.max_total_volume against the open volume and that trading is enabled on the account."),
-    ("netting", "This account nets positions, so it cannot hold a BUY and a SELL at once. Use a HEDGING demo account, "
-                "or set safety.require_hedging_for_scouts=false to run without the pair."),
-    ("day lock", "The account-wide demo lock is active for this trading date (daily loss, profit lock or consecutive "
-                 "losses). Scouts resume on the next trading date."),
-    ("live account", "The connected account is not a demo account. This bot refuses to trade live — connect the demo "
-                     "account in the terminal."),
-    ("market closed", "The broker calendar says the market is closed (weekend, holiday or early close). "
-                      "Scouts open at the next session start."),
-    ("no fresh tick", "No fresh tick from the terminal — the feed is down or the symbol is out of session. "
-                      "Check the terminal is connected and XAUUSD is in Market Watch."),
-    ("existing", "A scout pair for this session already exists at the broker; the duplicate was refused. "
-                 "Nothing to do — the running pair is intact."),
+    ("clock skew", "The MT5 tick time still disagrees with system UTC AFTER the broker timezone offset was removed, "
+                   "so this is the PC clock (or a genuinely wrong server clock), not the broker's timezone. "
+                   "Fix: enable automatic time sync on the Windows PC (w32tm /resync), then the guard clears itself. "
+                   "MT5 reports broker-server wall-clock times; the bot detects that offset and only blocks on what is left over."),
+    ("no fresh tick", "No tick inside broker_market_stale_seconds — the symbol's session is closed at the broker or the feed dropped. "
+                      "Fix: check Market Watch shows XAUUSD ticking; scouts retry automatically."),
+    ("spread", "Spread is above risk.max_spread_price. Fix: wait for the spread to normalise after the session open; "
+               "nothing to change unless the broker's typical spread is permanently wider."),
+    ("margin", "Not enough free margin for BOTH scout legs. Fix: lower risk.scout_lot, or free margin on the demo account."),
+    ("not safe", "The account safety gate refused: free margin, total volume or trade permission. "
+                 "Fix: check the Free margin vs required figure below and risk.max_total_volume."),
+    ("netting", "The account is NETTING, so opposing BUY and SELL legs cannot coexist and scouts are impossible. "
+                "Fix: use a HEDGING demo account, or set safety.require_hedging_for_scouts=false to run without scouts."),
+    ("day lock", "The account-wide daily lock is active (max loss, profit lock or consecutive losses). "
+                 "Fix: nothing today — it clears at the 17:00 New York trading-date rollover."),
+    ("live account", "The connected account is LIVE. This build is demo-only and will never place an order on it. "
+                     "Fix: log the terminal into the DEMO account."),
+    ("market closed", "The weekend/holiday/early-close calendar says the market is shut. "
+                      "Fix: nothing — the next session boundary reopens scouts."),
+    ("duplicate", "A scout pair for this session already exists at this magic number. "
+                  "Fix: nothing — the existing pair is used."),
+    ("disabled", "safety.allow_scout_orders is false. Fix: set it true in config.yaml."),
 )
 
 
-def reason_hint(payload: dict[str, Any]) -> str:
-    """Fix line for a failed scout placement: reason text first, retcode second (v3.3.0)."""
-    text = f"{payload.get('message') or ''} {payload.get('reason') or ''}".lower()
+def reason_hint(text: str) -> str:
+    """Map the human-readable failure reason to what to actually do about it (v3.3.0)."""
+    low = str(text or "").lower()
     for needle, hint in REASON_HINTS:
-        if needle in text:
-            if needle == "spread" and payload.get("spread") is not None:
-                return f"{hint} (spread {_f(payload.get('spread'))} vs limit {_f(payload.get('max_spread_price'))})"
-            if needle in {"margin", "not safe"} and payload.get("margin_free") is not None:
-                return f"{hint} (free margin {_f(payload.get('margin_free'))} for {_f(payload.get('pair_volume'))} lot)"
-            if needle == "clock skew":
-                return (f"{hint} Detected broker offset UTC{float(payload.get('broker_utc_offset_hours') or 0):+g}h, "
-                        f"residual skew {_f(payload.get('residual_skew_seconds'), 0)}s "
-                        f"(limit {payload.get('max_clock_skew_seconds', 600)}s).")
-            if needle == "day lock" and payload.get("day_lock"):
-                return f"{hint} Lock: {payload.get('day_lock')}."
+        if needle in low:
             return hint
-    retcode = payload.get("retcode")
-    if isinstance(retcode, (int, float)) or (isinstance(retcode, str) and str(retcode).isdigit()):
-        return RETCODE_HINTS.get(int(retcode), "") or "See !events 10 for the order_attempt retcodes"
-    return "See !events 10 for the order_attempt retcodes"
-
-
-def offset_line(payload: dict[str, Any]) -> str:
-    hours = payload.get("broker_utc_offset_hours")
-    if hours is None:
-        return "not measured yet"
-    source = payload.get("broker_clock_source", "auto")
-    residual = payload.get("residual_skew_seconds", payload.get("broker_clock_residual_seconds"))
-    return f"UTC{float(hours):+g}h ({source}) · residual {_f(residual, 0)}s"
+    return ""
 
 
 def snapshot_dict(snapshot: Any) -> dict[str, Any]:
@@ -118,23 +96,7 @@ def _fields(*pairs: tuple[str, str, bool]) -> list[dict[str, Any]]:
     return [{"name": n, "value": (v or "—")[:1024], "inline": i} for n, v, i in pairs]
 
 
-def blocked_by_line(s: dict[str, Any]) -> str:
-    """Every router veto currently active, in router order — so a NO-GO explains itself (v3.3.0)."""
-    trace = _g(s, "analysis", "decision_trace", default={}) or {}
-    failed = trace.get("blocked_by") or s.get("blocked_by") or []
-    if not failed:
-        return "nothing — every router gate passed"
-    return "\n".join(f"• {g.get('name')} — {g.get('value')}"
-                      + (f" (needs {g.get('threshold')})" if g.get("threshold") not in (None, "") else "")
-                      for g in failed[:10])
-
-
-def next_line(s: dict[str, Any]) -> str:
-    trace = _g(s, "analysis", "decision_trace", default={}) or {}
-    items = trace.get("next") or []
-    return "\n".join(f"• {item}" for item in items[:6]) or "—"
-
-
+# --- ported from master (PR #3): reliability and "what to watch next", features the decision card does not cover ---
 def fakeout_text(s: dict[str, Any]) -> str:
     r = _g(s, "analysis", "historical_pattern_reliability", default={})
     n = r.get("samples", 0)
@@ -162,110 +124,197 @@ def next_pattern_text(s: dict[str, Any]) -> str:
             "This is what to watch next, not a prediction that it will occur.")
 
 
-def status_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
-    """Manual-readiness card: what the router decided, whether it is safe to act, what blocked it,
-    and what would flip it (manual framing from v3.2.1, gate table added in v3.3.0)."""
-    go = str(s.get("go_status", "NO-GO")); action = str(_g(s, "decision", "action", default="NO_TRADE"))
-    pa = s.get("pa_side") or "NEUTRAL"; conf = s.get("confluence", 0)
-    st = s.get("structures", {}); sc = s.get("scout", {}); im = _g(s, "analysis", "intermarket", default={})
-    zone = (s.get("zones") or [None])[0]; plan = s.get("trade_plan") or {}
-    tgt = _g(s, "analysis", "session_target", default={})
+def blocked_by_line(s: dict[str, Any]) -> str:
+    """Master-compatible renderer, reading the v3.4.0 trace: the gates that are not passing, in order."""
     trace = _g(s, "analysis", "decision_trace", default={}) or {}
-    clock = _g(s, "analysis", "broker_clock", default={}) or {}
-    ready = (go == "GO" and action in {"LONG", "SHORT"} and bool(plan)
-             and bool(sc.get("buy_ticket") and sc.get("sell_ticket")) and sc.get("verdict") == "CONFIRMS")
-    manual_action = f"{'BUY' if action == 'LONG' else 'SELL'} READY" if ready else "WAIT / NO MANUAL ENTRY"
-    colour = GREEN if ready else AMBER
+    failed = [g for g in (trace.get("gates") or []) if g.get("state") != "pass"] or (s.get("blocked_by") or [])
+    if not failed:
+        return "nothing — every router gate passed"
+    return "\n".join(f"• {g.get('label') or g.get('name')} — {g.get('value')}" for g in failed[:10])
 
-    plan_text = "UNAVAILABLE - no valid structural entry/SL/TP plan; do not enter."
-    if plan:
-        targets = "\n".join(f"TP{i + 1} {_f(tp)} · {_f((plan.get('actual_rr') or [])[i]) if i < len(plan.get('actual_rr') or []) else 'n/a'}R"
-                            for i, tp in enumerate(plan.get("take_profits") or []))
-        plan_text = (f"{'READY AT SNAPSHOT' if ready else 'WATCHLIST ONLY - NOT AN ENTRY'}\n"
-                     f"{plan.get('side')} entry {_f(plan.get('entry'))} · SL {_f(plan.get('stop_loss'))}\n"
-                     f"SL reason: {plan.get('sl_reason', 'structural invalidation')}\n{targets or 'No valid targets'}")
-    zone_text = f"{_f(zone.get('low'))}–{_f(zone.get('high'))} {zone.get('kind')}" if zone else "no zone"
-    gates = trace.get("gates") or []
-    gate_line = f"{trace.get('passed_count', 0)}/{trace.get('gate_count', len(gates))} gates passed" if gates else "gate table unavailable"
+
+def next_line(s: dict[str, Any]) -> str:
+    """Master-compatible renderer for "what flips it"."""
+    trace = _g(s, "analysis", "decision_trace", default={}) or {}
+    items = trace.get("flips") or trace.get("next") or []
+    return "\n".join(f"• {item}" for item in items[:6]) or "—"
+
+
+def offset_line(payload: dict[str, Any]) -> str:
+    hours = payload.get("broker_utc_offset_hours")
+    if hours is None:
+        return "not measured yet"
+    source = payload.get("broker_clock_source", "auto")
+    residual = payload.get("residual_skew_seconds", payload.get("broker_clock_residual_seconds"))
+    return f"UTC{float(hours):+g}h ({source}) · residual {_f(residual, 0)}s"
+
+
+COLOURS = {"green": GREEN, "amber": AMBER, "red": RED, "grey": GREY}
+
+
+def _gate_block(gates: list[dict], limit: int = 14) -> str:
+    """The checklist, first-blocking row included, in evaluation order."""
+    return "\n".join(f"{g.get('mark', '—')} {g.get('label')} · {g.get('value')}" for g in gates[:limit])
+
+
+def decision_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
+    """v3.4.0: THE status card — verdict, one-sentence why, the gate checklist, what flips it, evidence, levels."""
+    trace = _g(s, "analysis", "decision_trace", default=None)
+    if not trace:                                                   # pre-v3.4.0 snapshot: fall back to the old layout
+        return legacy_status_card(s, tz)
+    levels = trace.get("levels") or {}
+    footer = trace.get("footer") or {}
+    flips = trace.get("flips") or []
+    flip_text = "\n".join(f"{i}. {f}" for i, f in enumerate(flips, 1)) or "Nothing is blocking — the gates are clear."
+    zone_line = (f"{_f(levels.get('zone_low'))}–{_f(levels.get('zone_high'))} {levels.get('zone_kind') or ''}".strip()
+                 if levels.get("zone_low") is not None else "no zone selected")
+    tp1 = (f"{_f(levels.get('take_profit_1'))}"
+           + (f" ({_f(levels.get('take_profit_1_rr'))}R)" if levels.get("take_profit_1_rr") is not None else "")
+           ) if levels.get("take_profit_1") is not None else "n/a"
+    remaining = footer.get("remaining_vetoes") or []
+    footer_text = (f"GO today: {footer.get('go_today', 'n/a')} "
+                   f"({footer.get('go_cycles', 0)}/{footer.get('cycles_observed', 0)} cycles) · "
+                   f"calibration {footer.get('calibration', 'n/a')}\n"
+                   + (f"Still to clear after the zone: {', '.join(remaining)}\n" if remaining else "")
+                   + str(footer.get("hint", "")))
     return {
-        "title": f"{'🟢' if ready else '🟠'} {manual_action} · {s.get('symbol', 'XAUUSD')}",
-        "description": f"{s.get('session')} · {str(s.get('timestamp', ''))[:10]} {_t(s.get('timestamp'), tz)} {tz} · {_f(s.get('bid'))}/{_f(s.get('ask'))} spread {_f(s.get('spread'))} · data {s.get('freshness')}",
-        "color": colour,
+        "title": trace.get("title", ""),
+        "description": trace.get("sentence", ""),
+        "color": COLOURS.get(trace.get("colour"), GREY),
         "fields": _fields(
-            ("Verdict", str(trace.get("verdict") or _g(s, "decision", "reason", default="")), False),
-            ("Blocked by", blocked_by_line(s), False),
-            ("Next", next_line(s), False),
-            ("Router / confirmation", f"Signal {go} · {action} · PA {pa} confluence {conf}/100 (not a probability). Manual readiness also requires a complete confirming scout pair.", False),
-            ("Structure", f"D1 {_g(st, 'D1', 'state')} · H4 {_g(st, 'H4', 'state')} · H1 {_g(st, 'H1', 'state')} · M15 {_g(st, 'M15', 'state')} · M5 {_g(st, 'M5', 'state')}", False),
-            ("Scouts", f"{'PAIR ACTIVE' if sc.get('buy_ticket') and sc.get('sell_ticket') else 'PAIR INCOMPLETE / NOT PLACED - NO CONFIRMATION'}\n{sc.get('leader') or 'none'} · BUY {_f(sc.get('buy_pnl'))} / SELL {_f(sc.get('sell_pnl'))} · {sc.get('verdict')} {sc.get('strength')}/10 · pace {sc.get('market_speed')}", True),
-            ("Silver", f"{im.get('regime', 'n/a')} r={im.get('correlation')} · SMT {im.get('smt', 'NONE')} · leading {im.get('silver_leading', 'NONE')}", True),
-            ("Entry", f"{zone_text} · {s.get('entry_state')} · trigger {'CONFIRMED' if _g(s, 'trigger', 'confirmed') else 'waiting'}", False),
-            ("Manual entry / SL / targets", plan_text, False),
-            ("Next pattern to watch", next_pattern_text(s), False),
-            ("Fakeout assessment", fakeout_text(s), False),
-            ("Validity", "Snapshot only. Recheck !status before entry; cancel on invalidation, stale data or a changed decision. TP/SL apply to this MT5 feed, not a cTrader quote.", False),
-            ("$10 target", f"{tgt.get('target_verdict', 'n/a')} · {_f(_g(s, 'analysis', 'remaining_session_minutes'), 0)} min left", True),
-            ("Broker clock", offset_line(clock) if clock else "n/a", True),
-            ("What GO means", str(trace.get("go_meaning") or "GO = this cycle's demo setup passed every router gate; it is a signal, not an order."), False),
+            ("Gates", _gate_block(trace.get("gates") or []), False),
+            ("What flips it", flip_text, False),
+            ("Evidence FOR", "\n".join(trace.get("evidence_for") or []) or "none", True),
+            ("Evidence AGAINST", "\n".join(trace.get("evidence_against") or []) or "none", True),
+            ("Levels", f"price {_f(levels.get('price'))} · zone {zone_line}\n"
+                       f"SL {_f(levels.get('stop_loss'))} · TP1 {tp1} · ATR {_f(levels.get('atr'), 3)}", False),
         ),
-        "footer": {"text": f"{gate_line} · MTF {_g(s, 'analysis', 'multi_timeframe', 'label', default='n/a')} · calibration {_g(s, 'reporting', 'calibration_status', default='n/a')} · demo only"},
+        "footer": {"text": footer_text[:2048]},
     }
 
 
-def _sweep_lines(s: dict[str, Any], limit: int = 6) -> list[str]:
-    """Newest first, deduped on level_type+price, with ROUND_1 collapsed into one line (v3.3.0)."""
-    active = sorted((sw for sw in (s.get("sweeps") or []) if sw.get("active", True)), key=lambda x: x.get("age_bars", 0))
-    seen: set[tuple[str, str]] = set()
-    unique = []
-    for sw in active:
-        key = (str(sw.get("level_type")), _f(sw.get("level_price")))
-        if key not in seen:
-            seen.add(key)
-            unique.append(sw)
+def status_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
+    """The status card IS the decision card (v3.4.0)."""
+    return decision_card(s, tz)
 
-    def render(sw: dict[str, Any]) -> str:
-        return (f"{'▲' if sw.get('direction') == 'BULLISH' else '▼'} {sw.get('level_type')} {_f(sw.get('level_price'))}"
-                f" → wick {_f(sw.get('sweep_price'))} ({sw.get('age_bars')} bars)")
 
-    rounds = [sw for sw in unique if str(sw.get("level_type")) == "ROUND_1"]
-    entries: list[tuple[int, str]] = [(int(sw.get("age_bars", 0)), render(sw)) for sw in unique
-                                      if str(sw.get("level_type")) != "ROUND_1"]
-    if len(rounds) == 1:
-        entries.append((int(rounds[0].get("age_bars", 0)), render(rounds[0])))
-    elif rounds:
+def legacy_status_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
+    """[GO] / [NO-GO] card as shipped before v3.4.0 — kept for snapshots with no decision_trace."""
+    go = str(s.get("go_status", "NO-GO")); action = str(_g(s, "decision", "action", default="NO_TRADE"))
+    pa = s.get("pa_side") or "NEUTRAL"; conf = s.get("confluence", 0)
+    colour = GREEN if go == "GO" and action in {"LONG", "SHORT"} else (AMBER if action == "WAIT" else (GREY if go == "GO" else RED))
+    st = s.get("structures", {}); sc = s.get("scout", {}); im = _g(s, "analysis", "intermarket", default={})
+    zone = (s.get("zones") or [None])[0]; plan = s.get("trade_plan") or {}
+    tgt = _g(s, "analysis", "session_target", default={})
+    zone_text = f"{_f(zone.get('low'))}–{_f(zone.get('high'))} {zone.get('kind')}" if zone else "no zone"
+    plan_text = "none"
+    if plan:
+        tps = " / ".join(f"{_f(tp)} ({_f(rr)}R)" for tp, rr in zip(plan.get("take_profits") or [], plan.get("actual_rr") or []))
+        plan_text = f"{plan.get('side')} entry {_f(plan.get('entry'))} · SL {_f(plan.get('stop_loss'))}\nTP {tps or 'none'} · {plan.get('target_realism')}"
+    return {
+        "title": f"{'🟢' if colour == GREEN else '🟠' if colour == AMBER else '⚪' if colour == GREY else '🔴'} {go} · {action} · {pa} {conf}/100",
+        "description": f"{s.get('session')} · {_t(s.get('timestamp'), tz)} · {_f(s.get('bid'))}/{_f(s.get('ask'))} spread {_f(s.get('spread'))} · data {s.get('freshness')}",
+        "color": colour,
+        "fields": _fields(
+            ("Structure", f"D1 {_g(st, 'D1', 'state')} · H4 {_g(st, 'H4', 'state')} · H1 {_g(st, 'H1', 'state')} · M15 {_g(st, 'M15', 'state')} · M5 {_g(st, 'M5', 'state')}", False),
+            ("Scouts", f"{sc.get('leader') or 'none'} · BUY {_f(sc.get('buy_pnl'))} / SELL {_f(sc.get('sell_pnl'))} · {sc.get('verdict')} {sc.get('strength')}/10 · pace {sc.get('market_speed')}", True),
+            ("Silver", f"{im.get('regime', 'n/a')} r={im.get('correlation')} · SMT {im.get('smt', 'NONE')} · leading {im.get('silver_leading', 'NONE')}", True),
+            ("Entry", f"{zone_text} · {s.get('entry_state')} · trigger {'CONFIRMED' if _g(s, 'trigger', 'confirmed') else 'waiting'}", False),
+            ("Plan", plan_text, False),
+            ("$10 target", f"{tgt.get('target_verdict', 'n/a')} · {_f(_g(s, 'analysis', 'remaining_session_minutes'), 0)} min left", True),
+            ("Blocked by", blocked_by_text(s), False),
+            ("Why", str(_g(s, "decision", "reason", default="")), False),
+        ),
+        "footer": {"text": f"MTF {_g(s, 'analysis', 'multi_timeframe', 'label', default='n/a')} · calibration {_g(s, 'reporting', 'calibration_status', default='n/a')} · demo only"},
+    }
+
+
+def _sweep_lines(sweeps: list[dict], tz: str, limit: int = 6) -> list[str]:
+    """Newest first, identical level_type+price collapsed, ROUND_1 folded into one counted line (v3.3.0).
+    The collapsed line takes its place by the age of its newest member, so stale round levels cannot push
+    fresher sweeps out of the limit."""
+    active = [sw for sw in (sweeps or []) if sw.get("active", True)]
+    unique: dict[tuple, dict] = {}
+    for sw in sorted(active, key=lambda x: x.get("age_bars", 0)):
+        key = (sw.get("level_type"), round(float(sw.get("level_price") or 0), 2))
+        unique.setdefault(key, sw)
+    ordered = sorted(unique.values(), key=lambda x: x.get("age_bars", 0))
+    rounds = [sw for sw in ordered if str(sw.get("level_type")) == "ROUND_1"]
+    entries: list[tuple[float, str]] = []
+    if rounds:
         prices = sorted(float(sw.get("level_price") or 0) for sw in rounds)
-        entries.append((int(rounds[0].get("age_bars", 0)), f"ROUND_1 ×{len(rounds)} ({prices[0]:.0f}–{prices[-1]:.0f})"))
-    return [line for _, line in sorted(entries, key=lambda item: item[0])][:limit]
+        span = _f(prices[0]) if len(prices) == 1 else f"{_f(prices[0])}–{_f(prices[-1])}"
+        newest = rounds[0]
+        entries.append((newest.get("age_bars", 0),
+                        f"{'▲' if newest.get('direction') == 'BULLISH' else '▼'} ROUND_1 ×{len(rounds)} ({span})"
+                        f" · newest {newest.get('age_bars')} bars"))
+    for sw in ordered:
+        if str(sw.get("level_type")) == "ROUND_1":
+            continue
+        entries.append((sw.get("age_bars", 0),
+                        f"{'▲' if sw.get('direction') == 'BULLISH' else '▼'} {sw.get('level_type')} {_f(sw.get('level_price'))}"
+                        f" → wick {_f(sw.get('sweep_price'))} ({sw.get('age_bars')} bars)"))
+    entries.sort(key=lambda item: item[0])
+    return [line for _, line in entries[:limit]]
 
 
-def detections_card(s: dict[str, Any], tz: str, limit: int = 8) -> dict[str, Any]:
-    """What the engine currently sees: candle/chart patterns, structure events, sweeps, live zones."""
+def _zone_lines(s: dict[str, Any], limit: int = 5) -> list[str]:
+    atr = _g(s, "analysis", "atr")
+    price = s.get("bid")
+    lines = []
+    for z in (s.get("zones") or [])[:limit]:
+        distance = ""
+        try:
+            mid = (float(z.get("low")) + float(z.get("high"))) / 2
+            gap = abs(float(price) - mid)
+            distance = f" · {gap / float(atr):.2f} ATR away" if atr else f" · {gap:.2f} away"
+        except (TypeError, ValueError, ZeroDivisionError):
+            distance = ""
+        lines.append(f"{z.get('side')} {z.get('kind')} {_f(z.get('low'))}–{_f(z.get('high'))} · score {_f(z.get('score'), 1)} · {z.get('status')}{distance}")
+    return lines
+
+
+def detections_card(s: dict[str, Any], tz: str, limit: int = 8, full: bool = False) -> dict[str, Any]:
+    """v3.4.0: a compact companion to the decision card. `!detected full` restores the long form."""
     pats = s.get("patterns") or []
+    bias = s.get("pa_side")
+    structure_line = " ".join(
+        f"{tf} {'▲' if _g(s, 'structures', tf, 'state') == 'BULLISH' else '▼' if _g(s, 'structures', tf, 'state') == 'BEARISH' else '•'}"
+        for tf in ("D1", "H4", "H1", "M15", "M5"))
+    if not full:
+        # 3 newest patterns, 3 newest sweeps on the bias side, zones with ATR distance — nothing else.
+        pat_lines = [f"{_t(p.get('timestamp'), tz)} {p.get('name') or p.get('event')}"
+                     + (f" ({p.get('timeframe')})" if p.get("timeframe") else "") for p in pats[-3:]]
+        wanted = "BULLISH" if bias == "LONG" else "BEARISH" if bias == "SHORT" else None
+        relevant = [sw for sw in (s.get("sweeps") or [])
+                    if sw.get("active", True) and (wanted is None or sw.get("direction") == wanted)]
+        return {
+            "title": f"🔍 Detected · {s.get('session')} · {_t(s.get('timestamp'), tz)}",
+            "color": PURPLE,
+            "description": structure_line,
+            "fields": _fields(
+                ("Newest patterns", "\n".join(pat_lines), False),
+                (f"Sweeps on the {bias or 'neutral'} side", "\n".join(_sweep_lines(relevant, tz, limit=3)), False),
+                ("Zones (distance in ATR)", "\n".join(_zone_lines(s)), False),
+            ),
+            "footer": {"text": f"PA {bias or 'NEUTRAL'} {s.get('confluence')}/100 · `!detected full` for everything · `!why` for the gates"},
+        }
     pat_lines = [f"{_t(p.get('timestamp'), tz)} {p.get('name') or p.get('event')}" + (f" ({p.get('timeframe')})" if p.get("timeframe") else "") for p in pats[-limit:]]
     ev_lines = []
     for tf in ("H4", "H1", "M15", "M5"):
-        for e in (_g(s, "structures", tf, "events", default=[]) or [])[-2:]:                    # two newest per timeframe
+        for e in (_g(s, "structures", tf, "events", default=[]) or [])[-2:]:            # two newest per timeframe
             ev_lines.append(f"{tf} {e.get('event')} @ {_f(e.get('level'))} {_t(e.get('timestamp'), tz)}")
-    sweeps = _sweep_lines(s, 6)
-    price = float(s.get("bid") or 0) or None
-    atr = _g(s, "analysis", "atr", default=None) or _g(s, "reporting", "atr", default=None)
-    zones = []
-    for z in (s.get("zones") or [])[:5]:
-        line = f"{z.get('side')} {z.get('kind')} {_f(z.get('low'))}–{_f(z.get('high'))} · score {_f(z.get('score'), 1)} · {z.get('status')}"
-        if price and atr:
-            middle = (float(z.get("low", 0)) + float(z.get("high", 0))) / 2
-            line += f" · {abs(price - middle) / float(atr):.1f} ATR away"
-        zones.append(line)
     return {
-        "title": f"🔍 Detected · {s.get('session')} · {_t(s.get('timestamp'), tz)}",
+        "title": f"🔍 Detected (full) · {s.get('session')} · {_t(s.get('timestamp'), tz)}",
         "color": PURPLE,
+        "description": structure_line,
         "fields": _fields(
             ("Candle / chart patterns", "\n".join(pat_lines), False),
-            ("Structure events", "\n".join(ev_lines), False),
-            ("Active sweeps", "\n".join(sweeps), False),
-            ("Zones (best first)", "\n".join(zones), False),
+            ("Structure events (2 newest / TF)", "\n".join(ev_lines), False),
+            ("Active sweeps (6 newest)", "\n".join(_sweep_lines(s.get("sweeps") or [], tz)), False),
+            ("Zones (best first, distance in ATR)", "\n".join(_zone_lines(s)), False),
         ),
-        "footer": {"text": f"PA {s.get('pa_side') or 'NEUTRAL'} {s.get('confluence')}/100 · {len(pats)} patterns · {len(s.get('sweeps') or [])} sweeps · {len(s.get('zones') or [])} zones"},
+        "footer": {"text": f"PA {bias or 'NEUTRAL'} {s.get('confluence')}/100 · {len(pats)} patterns · {len(s.get('sweeps') or [])} sweeps · {len(s.get('zones') or [])} zones"},
     }
 
 
@@ -275,122 +324,196 @@ def detection_signature(s: dict[str, Any]) -> str:
     evs = tuple((tf, e.get("event"), str(e.get("timestamp"))) for tf in ("H4", "H1", "M15", "M5")
                 for e in (_g(s, "structures", tf, "events", default=[]) or [])[-2:])
     sweeps = tuple((sw.get("level_type"), str(sw.get("sweep_time"))) for sw in (s.get("sweeps") or []) if sw.get("active", True))
-    return str(hash((pats, evs, sweeps)))
+    # v3.3.0: the card shows zones, so a new or changed zone has to move the signature too — otherwise the
+    # detections push never fires for one. Coarse identity (kind, bounds, status) keeps score drift out of it.
+    zones = tuple((z.get("kind"), z.get("side"), round(float(z.get("low") or 0), 2),
+                   round(float(z.get("high") or 0), 2), z.get("status")) for z in (s.get("zones") or [])[:5])
+    return str(hash((pats, evs, sweeps, zones)))
 
 
-def scout_card(kind: str, payload: dict[str, Any], tz: str = "UTC") -> dict[str, Any]:
-    """One card per scout lifecycle event, each telling the whole story (v3.3.0)."""
+VETO_LABELS = {
+    "trigger_consumed": "Trigger consumed", "trigger_ownership": "Trigger belongs elsewhere",
+    "data_stale": "M1 data stale", "account_safety": "Account not safe",
+    "spread": "Spread", "setup": "No valid setup", "confluence": "Confluence < min",
+    "zone": "Not inside zone", "trigger": "No fresh trigger", "slow": "Market SLOW",
+    "scouts": "Scouts contradict", "rr": "Risk-reward", "target": "$10 target",
+    "higher_tf_conflict": "Higher-timeframe conflict", "session_target": "Session target UNLIKELY",
+    "session_feasibility": "Session feasibility", "cold_start": "Cold start cycle",
+    "send_time": "Withheld at send", "clock": "Broker clock", "day_lock": "Day lock",
+}
+
+
+def blocked_by_text(s: dict[str, Any]) -> str:
+    """Every router veto standing in the way right now, in evaluation order (v3.3.0). A NO-GO explains itself."""
+    items = _g(s, "analysis", "blocked_by", default=[]) or []
+    if not items:
+        return "nothing — every router veto is clear"
+    return "\n".join(f"• {VETO_LABELS.get(i.get('veto'), i.get('veto'))}: {i.get('detail')}" for i in items)
+
+
+def why_text(s: dict[str, Any]) -> str:
+    """`!why`: the blocking vetoes plus what would flip each one."""
+    items = _g(s, "analysis", "blocked_by", default=[]) or []
+    if not items:
+        return "Nothing is blocking a trade: every router veto is clear."
+    lines = []
+    for i in items:
+        lines.append(f"• **{VETO_LABELS.get(i.get('veto'), i.get('veto'))}** — {i.get('detail')}\n   flips when: {i.get('flips_when')}")
+    return "\n".join(lines)
+
+
+def _lot_line(payload: dict[str, Any]) -> str:
+    return f"{payload.get('lot', payload.get('volume', ''))} lot"
+
+
+def scout_card(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """v3.3.0: every scout lifecycle event carries the whole story, not a headline."""
     session = payload.get("session", "")
     if kind == "scout_open_failed":
-        attempt = payload.get("attempt", 1)
-        retry = payload.get("next_retry")
-        retry_text = (f"{_t(retry, payload.get('display_timezone') or tz)} "
-                      f"({payload.get('display_timezone') or tz})") if retry else (
-            "automatic with backoff (up to 5 minutes), while this session is current"
-            if payload.get("retryable", True) else "no — needs a config or account change")
+        retcode = payload.get("retcode")
+        code_hint = RETCODE_HINTS.get(int(retcode), "") if isinstance(retcode, (int, float)) or (isinstance(retcode, str) and str(retcode).isdigit()) else ""
+        message = str(payload.get("message") or payload.get("reason") or "")
+        hint = " ".join(x for x in (code_hint, reason_hint(message), payload.get("hint") or "") if x).strip()
+        offset = payload.get("broker_utc_offset_hours")
+        offset_text = "not measured yet"
+        if offset is not None:
+            offset_text = (f"broker clock UTC{float(offset):+g} ({payload.get('broker_clock_source', 'auto')}) · "
+                           f"residual skew {payload.get('broker_clock_residual_seconds')}s vs limit {payload.get('max_clock_skew_seconds')}s")
         return {"title": f"🔴 SCOUTS NOT PLACED · {session}", "color": RED,
-                "fields": _fields(("Reason", str(payload.get("message") or payload.get("reason")), False),
-                                  ("Fix", reason_hint(payload), False),
-                                  ("Next retry", retry_text, True),
-                                  ("Detected offset", offset_line(payload), True),
-                                  ("Attempt", f"#{attempt}", True))}
+                "fields": _fields(
+                    ("Reason", message, False),
+                    ("Fix", hint or "See !events 10 for order_attempt retcodes", False),
+                    ("Detected offset", offset_text, False),
+                    ("Spread", f"{_f(payload.get('spread'))} vs limit {_f(payload.get('max_spread'))}", True),
+                    ("Margin", f"free {_f(payload.get('margin_free'))} vs required {_f(payload.get('margin_required'))}", True),
+                    ("Attempt", f"#{payload.get('attempt', 1)}", True),
+                    ("Next retry", str(payload.get("next_retry_local") or ("automatic on the next cycle" if payload.get("retryable", True) else "no — needs a config/account change")), True),
+                )}
     if kind == "scout_session_open":
-        failed = int(payload.get("failed_attempts") or 0)
-        title = f"🟢 SCOUTS PLACED · {session}" + (f" · after {failed} failed attempt{'s' if failed != 1 else ''}" if failed else "")
-        sl = payload.get("emergency_sl_price")
+        after = payload.get("after_failed_attempts") or 0
+        title = f"🟢 SCOUTS PLACED · {session}" + (f" · after {after} failed attempt{'s' if after != 1 else ''}" if after else "")
         return {"title": title, "color": GREEN,
-                "description": f"BUY + SELL {payload.get('lot', '')} lot · magic {payload.get('magic')}",
+                "description": f"BUY + SELL {_lot_line(payload)} · magic {payload.get('magic')}",
                 "fields": _fields(
-                    ("BUY", f"#{payload.get('buy_ticket')} @ {_f(payload.get('buy_entry'))}"
-                            + (f" · SL {_f(payload.get('buy_sl'))}" if payload.get("buy_sl") else ""), True),
-                    ("SELL", f"#{payload.get('sell_ticket')} @ {_f(payload.get('sell_entry'))}"
-                             + (f" · SL {_f(payload.get('sell_sl'))}" if payload.get("sell_sl") else ""), True),
-                    ("Session open", f"{_f(payload.get('open_price'))} at {_t(payload.get('open_time'), tz)}", True),
-                    ("Emergency SL", f"{_f(sl)} price distance" if sl else "none configured", True))}
-    if kind == "scout_session_close":
-        buy, sell = payload.get("buy_pnl"), payload.get("sell_pnl")
-        return {"title": f"⚪ SCOUTS CLOSED · {session}", "color": GREY,
-                "fields": _fields(
-                    ("BUY", f"#{payload.get('buy_ticket')} · P/L {_f(buy)} · MFE {_f(payload.get('buy_mfe'))} / MAE {_f(payload.get('buy_mae'))}", True),
-                    ("SELL", f"#{payload.get('sell_ticket')} · P/L {_f(sell)} · MFE {_f(payload.get('sell_mfe'))} / MAE {_f(payload.get('sell_mae'))}", True),
-                    ("Pair P/L", _f(payload.get("pnl")), True),
-                    ("Leader", f"{payload.get('leader') or 'NONE'} · {payload.get('verdict') or 'NEUTRAL'} {payload.get('strength', 0)}/10", True),
-                    ("Pace", f"{payload.get('market_speed') or 'n/a'} · displacement {_f(payload.get('displacement'))}", True),
-                    ("Message", str(payload.get("message") or payload.get("reason") or ""), False))}
+                    ("BUY leg", f"#{payload.get('buy_ticket', 'n/a')} @ {_f(payload.get('buy_entry'))}", True),
+                    ("SELL leg", f"#{payload.get('sell_ticket', 'n/a')} @ {_f(payload.get('sell_entry'))}", True),
+                    ("Session open price", _f(payload.get("open_price")), True),
+                    ("Emergency SL distance", f"{_f(payload.get('emergency_sl_price_distance'))} price", True),
+                )}
     if kind == "scout_rollback":
         return {"title": f"🔴 SCOUT LEG ROLLED BACK · {session}", "color": RED,
-                "fields": _fields(("Failed leg", f"{payload.get('failed_leg', 'n/a')} · retcode {payload.get('retcode', 'n/a')}", True),
-                                  ("Closed", ", ".join(f"#{x}" for x in (payload.get("closed_tickets") or [])) or "nothing to close", True),
-                                  ("Reason", str(payload.get("reason") or payload.get("message") or ""), False),
-                                  ("Fix", reason_hint(payload), False))}
+                "fields": _fields(
+                    ("Failed leg", f"{payload.get('failed_leg', 'SELL')} — retcode {payload.get('retcode', 'n/a')}", True),
+                    ("Reason", str(payload.get("reason") or payload.get("message") or ""), False),
+                    ("Closed", f"{payload.get('closed_tickets') or 'the surviving leg'} · {payload.get('pending', 0)} close(s) queued for retry", False),
+                    ("Fix", reason_hint(str(payload.get("reason") or payload.get("message") or "")) or "Retried automatically at the next cycle", False),
+                )}
+    if kind == "scout_session_close":
+        return {"title": f"⚪ SCOUTS CLOSED · {session}", "color": GREY,
+                "fields": _fields(
+                    ("BUY", f"#{payload.get('buy_ticket', 'n/a')} · P/L {_f(payload.get('buy_pnl'))} · MFE {_f(payload.get('buy_mfe'))} / MAE {_f(payload.get('buy_mae'))}", False),
+                    ("SELL", f"#{payload.get('sell_ticket', 'n/a')} · P/L {_f(payload.get('sell_pnl'))} · MFE {_f(payload.get('sell_mfe'))} / MAE {_f(payload.get('sell_mae'))}", False),
+                    ("Pair P/L", _f(payload.get("pnl") if payload.get("pnl") is not None else payload.get("pair_pnl")), True),
+                    ("Leader", str(payload.get("leader", "n/a")), True),
+                    ("Verdict", f"{payload.get('verdict', 'n/a')} {payload.get('strength', 0)}/10", True),
+                    ("Message", str(payload.get("message") or payload.get("reason") or ""), False),
+                )}
     if kind == "scout_adopted":
-        return {"title": f"🟠 SCOUTS ADOPTED ON RESTART · {session}", "color": AMBER,
-                "fields": _fields(("Tickets", f"BUY #{payload.get('buy_ticket')} · SELL #{payload.get('sell_ticket')}", True),
-                                  ("Legs", f"{payload.get('legs', 0)} · {payload.get('lot', '')} lot", True),
-                                  ("Session open", f"{_f(payload.get('open_price'))} at {_t(payload.get('open_time'), tz)}", True),
-                                  ("MFE/MAE restored", ", ".join(str(x) for x in (payload.get("mfe_mae_restored") or [])) or "no", True))}
+        return {"title": f"🟠 SCOUTS ADOPTED · {session}", "color": AMBER,
+                "description": "Restart recovery — the existing pair was re-attached instead of re-opened.",
+                "fields": _fields(
+                    ("Tickets", str(payload.get("tickets") or "n/a"), True),
+                    ("Legs", str(payload.get("legs", 0)), True),
+                    ("MFE/MAE restored", str(payload.get("mfe_mae_restored") or "no stored extrema"), False),
+                    ("Session open", f"{_f(payload.get('open_price'))} at {payload.get('open_time') or 'n/a'}", False),
+                )}
     return {"title": f"⚠️ SCOUT {kind.replace('scout_', '').replace('_', ' ').upper()} · {session}", "color": AMBER,
             "description": str(payload.get("message") or payload.get("reason") or payload.get("leader") or "pair lifecycle updated")}
 
 
-def order_card(kind: str, payload: dict[str, Any], tz: str = "UTC") -> dict[str, Any]:
-    """Order and management cards: the full trade, then what changed and what is left (v3.3.0)."""
-    side = payload.get("side", ""); colour = GREEN if side == "LONG" else RED if side == "SHORT" else BLUE
-    titles = {"order": f"📥 ORDER PLACED · {side}", "order_withheld": "⛔ ORDER WITHHELD", "pa_partial": "💰 PARTIAL CLOSE",
-              "pa_breakeven": "🔒 SL moved to break-even", "pa_breakeven_retry": "🔒 Break-even retry",
-              "pa_tp2_lock": "💰 TP2 — SL locked at TP1", "pa_tp2_lock_retry": "💰 TP2 lock retry",
-              "pa_trail": "📈 Trailing stop moved", "pa_close": "🏁 Position closed", "trade_closed": "🏁 Trade closed"}
-    if kind == "order":
-        tps = " / ".join(f"{_f(tp)} ({_f(rr)}R)" for tp, rr in zip(payload.get("take_profits") or [], payload.get("actual_rr") or [])) or "none"
-        risk = f"{_f(payload.get('risk_price'))} price"
-        if payload.get("risk_currency") is not None:
-            risk += f" ≈ {_f(payload.get('risk_currency'))} at {payload.get('volume')} lot"
-        return {"title": titles["order"], "color": colour,
-                "description": f"#{payload.get('ticket')} · {payload.get('session')} · entry {_f(payload.get('entry'))} · {payload.get('volume')} lot",
+def _tp_text(payload: dict[str, Any]) -> str:
+    tps = payload.get("take_profits") or payload.get("tp") or []
+    rrs = payload.get("actual_rr") or payload.get("rr") or []
+    if isinstance(tps, (int, float)):
+        tps = [tps]
+    if isinstance(rrs, (int, float)):
+        rrs = [rrs]
+    if not tps:
+        return "none"
+    parts = []
+    for i, tp in enumerate(tps):
+        rr = rrs[i] if i < len(rrs) else None
+        parts.append(f"TP{i + 1} {_f(tp)}" + (f" ({_f(rr)}R)" if rr is not None else ""))
+    return " · ".join(parts)
+
+
+def order_card(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """v3.3.0: an order card carries the whole trade, and every management card carries the running result."""
+    side = payload.get("side", "")
+    colour = GREEN if side == "LONG" else RED if side == "SHORT" else BLUE
+    titles = {"order": f"📥 ORDER PLACED · {side}", "order_withheld": "⛔ ORDER WITHHELD", "pa_partial": "💰 TP1 — 50% closed",
+              "pa_breakeven": "🔒 SL moved to break-even", "pa_tp2_lock": "💰 TP2 — 25% closed, SL locked at TP1",
+              "pa_trail": "📈 Trailing stop moved", "pa_close": "🏁 Position closed", "trade_closed": "🏁 Trade closed",
+              "pa_breakeven_retry": "🔒 SL moved to break-even (retry)", "pa_tp2_lock_retry": "💰 TP2 SL lock (retry)"}
+    if kind in {"order", "order_withheld"}:
+        # v3.4.0: same skeleton as the decision card — title, verdict sentence, the gates it cleared, the plan.
+        rejected = kind == "order" and payload.get("success") is False
+        placed = kind == "order" and not rejected
+        title = (f"🔴 ORDER REJECTED · {side}" if rejected else
+                 f"🟢 {side} PLACED · #{payload.get('ticket', 'n/a')} · {payload.get('volume', 'n/a')} lot" if placed
+                 else titles[kind])
+        sentence = (f"{side} filled at {_f(payload.get('entry') or payload.get('price'))} risking "
+                    f"{_f(payload.get('risk_currency'))} with stop {_f(payload.get('stop_loss') or payload.get('sl'))}. "
+                    f"Targets {_tp_text(payload)}." if placed
+                    else str(payload.get("reason") or payload.get("message") or ""))
+        gates_cleared = "\n".join([
+            f"✅ Data fresh · {_f(payload.get('m1_age_seconds'), 0)}s · {payload.get('freshness', 'n/a')}",
+            f"✅ Spread · {_f(payload.get('spread'))} / {_f(payload.get('max_spread'))}",
+            f"✅ Confluence · {payload.get('confluence', 'n/a')} / {payload.get('min_confluence', 'n/a')}",
+            f"✅ Trigger · {payload.get('trigger_reason', 'n/a')}",
+            f"✅ Risk-reward · {_f(payload.get('rr'))} / {_f(payload.get('min_rr'))} · target {payload.get('target_realism', 'n/a')}",
+        ])
+        management = (f"TP1 closes {payload.get('partial_tp1_percent', 0)}% then SL → break-even at "
+                      f"{_f(payload.get('breakeven_at_rr'), 1)}R\n"
+                      f"TP2 closes {payload.get('partial_tp2_percent', 0)}% and locks SL at TP1 · runner trails from "
+                      f"{_f(payload.get('trailing_start_rr'), 1)}R\nInvalidation: {payload.get('invalidation', 'n/a')}")
+        return {"title": title, "color": RED if rejected else (colour if kind == "order" else AMBER),
+                "description": sentence,
                 "fields": _fields(
-                    ("Stop loss", f"{_f(payload.get('stop_loss'))} ({payload.get('sl_reason')})", True),
-                    ("Take profits", tps, True),
-                    ("Risk", risk, True),
-                    ("Zone", f"{payload.get('zone_kind') or 'n/a'} {payload.get('zone') or ''}", True),
-                    ("Trigger", f"{payload.get('trigger_source')} · {payload.get('trigger_reason')}", False),
-                    ("Confluence", f"{payload.get('confluence')}/100 · scouts {payload.get('scout_verdict')} "
-                                   f"{payload.get('scout_strength')}/10 (leader {payload.get('scout_leader')})", True),
-                    ("Silver", str(payload.get("silver") or "n/a"), True),
-                    ("Invalidation", str(payload.get("invalidation") or ""), False))}
-    if kind in {"pa_partial", "pa_breakeven", "pa_breakeven_retry", "pa_tp2_lock", "pa_tp2_lock_retry", "pa_trail", "pa_close"}:
-        label = payload.get("label")
-        title = titles.get(kind, kind.upper())
-        if kind == "pa_partial" and label:
-            title = f"💰 {label.replace('PA_', '')} — {_f(payload.get('confirmed_volume'))} lot closed"
-        ok = payload.get("success", True)
-        return {"title": ("" if ok else "⚠️ FAILED · ") + title, "color": (BLUE if ok else AMBER) if kind != "pa_close" else (GREY if ok else AMBER),
-                "description": f"#{payload.get('ticket')} {side} · {payload.get('session') or ''} · entry {_f(payload.get('entry'))}",
+                    ("Ticket / entry", f"#{payload.get('ticket', 'n/a')} @ {_f(payload.get('entry') or payload.get('price'))}", True),
+                    ("Volume / risk", f"{payload.get('volume', 'n/a')} lot · risk {_f(payload.get('risk_currency'))} {payload.get('currency', '')}".strip(), True),
+                    ("Stop loss", _f(payload.get("stop_loss") or payload.get("sl")), True),
+                    ("Take profits", _tp_text(payload), False),
+                    ("Gates cleared", gates_cleared, False),
+                    ("Management plan", management, False),
+                    ("Zone / trigger", f"{payload.get('zone_kind', 'n/a')} · {payload.get('trigger_reason', 'n/a')}", False),
+                    ("Confluence / scouts", f"{payload.get('confluence', 'n/a')}/100 · scouts {payload.get('scout_verdict', 'n/a')} "
+                                            f"{payload.get('scout_strength', 0)}/10 (leader {payload.get('scout_leader', 'n/a')})", False),
+                ),
+                "footer": {"text": f"Silver: {payload.get('silver') or payload.get('intermarket') or 'n/a'} · demo only"}}
+    if kind in {"pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close", "trade_closed",
+                "pa_breakeven_retry", "pa_tp2_lock_retry"}:
+        return {"title": titles[kind], "color": colour,
+                "description": str(payload.get("reason") or payload.get("exit_reason") or payload.get("message") or ""),
                 "fields": _fields(
-                    ("Realised so far", _f(payload.get("realized_pnl")), True),
-                    ("Remaining volume", f"{_f(payload.get('remaining_volume'))} of {_f(payload.get('original_volume'))} lot", True),
-                    ("New SL", f"{_f(payload.get('new_sl', payload.get('sl')))}"
-                               + (f" (was {_f(payload.get('previous_sl'))})" if payload.get("previous_sl") is not None else ""), True),
-                    ("Targets", " / ".join(f"{_f(tp)} ({_f(rr)}R)" for tp, rr in
-                                           zip(payload.get("take_profits") or [], payload.get("actual_rr") or [])) or "none", False),
-                    ("Detail", str(payload.get("reason") or payload.get("message") or ""), False))}
+                    ("Ticket", f"#{payload.get('ticket', 'n/a')} · {side or payload.get('kind', '')}", True),
+                    ("Realised P/L so far", _f(payload.get("realized_pnl") if payload.get("realized_pnl") is not None else payload.get("pnl")), True),
+                    ("Remaining volume", f"{payload.get('remaining_volume', payload.get('volume', 'n/a'))} lot", True),
+                    ("New SL", _f(payload.get("new_sl") or payload.get("sl")), True),
+                    ("R multiple", _f(payload.get("r")), True),
+                )}
     lines = [f"{k}: {v}" for k, v in payload.items()
              if k in ("ticket", "entry", "price", "sl", "stop_loss", "tp", "take_profits", "volume", "pnl", "r",
                       "exit_reason", "reason", "message", "session", "comment") and v not in (None, "")]
-    return {"title": titles.get(kind, kind.upper()), "color": colour if kind != "order_withheld" else AMBER,
-            "description": "\n".join(str(x) for x in lines)[:2000]}
+    return {"title": titles.get(kind, kind.upper()), "color": colour, "description": "\n".join(str(x) for x in lines)[:2000]}
 
 
-def event_card(kind: str, payload: dict[str, Any], tz: str = "UTC") -> dict[str, Any]:
+def event_card(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     if kind.startswith("scout_"):
-        return scout_card(kind, payload, tz)
-    if kind in {"order", "order_withheld", "pa_partial", "pa_breakeven", "pa_breakeven_retry", "pa_tp2_lock",
-                "pa_tp2_lock_retry", "pa_trail", "pa_close", "trade_closed"}:
-        return order_card(kind, payload, tz)
-    if kind == "broker_clock_offset":
-        return {"title": f"🕒 BROKER CLOCK · UTC{float(payload.get('broker_utc_offset_hours') or 0):+g}h", "color": BLUE,
-                "fields": _fields(("Detected offset", offset_line(payload), True),
-                                  ("Server", str(payload.get("server") or "n/a"), True),
-                                  ("What this means", str(payload.get("message") or ""), False))}
+        return scout_card(kind, payload)
+    if kind in {"order", "order_withheld", "pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close",
+                "trade_closed", "pa_breakeven_retry", "pa_tp2_lock_retry"}:
+        return order_card(kind, payload)
     if kind == "session_transition":
         ok = payload.get("success", True)
         return {"title": f"{'🕒' if ok else '🔴'} SESSION {payload.get('kind', '')} · {payload.get('session', '')}" + ("" if ok else " · FAILED"),
@@ -403,6 +526,16 @@ def event_card(kind: str, payload: dict[str, Any], tz: str = "UTC") -> dict[str,
     if kind == "smt_divergence":
         return {"title": f"🥈 SMT {payload.get('smt')} · XAU vs {payload.get('symbol')} ({payload.get('timeframe')})", "color": PURPLE,
                 "description": f"XAU {_g(payload, 'detail', 'xau')} vs XAG {_g(payload, 'detail', 'xag')} · r={payload.get('correlation')} {payload.get('regime')}"}
+    if kind == "broker_clock_offset":
+        hours = payload.get("offset_hours", 0)
+        return {"title": f"🕰️ BROKER CLOCK · UTC{float(hours):+g}", "color": BLUE if payload.get("residual_skew_seconds", 0) is not None else GREY,
+                "description": str(payload.get("message", "")),
+                "fields": _fields(("Detected offset", f"UTC{float(hours):+g} ({payload.get('source', 'auto')})", True),
+                                  ("Residual skew", f"{payload.get('residual_skew_seconds')}s vs limit {payload.get('max_clock_skew_seconds')}s", True),
+                                  ("Server", str(payload.get("server") or "n/a"), True),
+                                  ("Confidence", "clean" if payload.get("confident", True) else
+                                   f"⚠ raw delta sat {abs(float(payload.get('residual_skew_seconds') or 0)):.0f}s from the "
+                                   f"nearest half-hour — pin safety.broker_utc_offset_hours if this is wrong", False))}
     if kind in {"cycle_error", "startup_failed", "integration_disabled"}:
         return {"title": f"🔴 {kind.replace('_', ' ').upper()}", "color": RED, "description": json.dumps(payload, default=str)[:1900]}
     return {"title": f"ℹ️ {kind.replace('_', ' ').upper()}", "color": GREY, "description": json.dumps(payload, default=str)[:1900]}

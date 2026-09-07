@@ -17,7 +17,13 @@ class MockMT5:
     SYMBOL_TRADE_MODE_DISABLED = 0
     DEAL_ENTRY_OUT = 1; DEAL_REASON_SL = 4
 
-    def __init__(self):
+    TICK_EPOCH_UTC = 1788532800          # the true UTC instant of the mock's latest tick
+    BAR_SECONDS = {1: 60, 5: 300, 15: 900, 60: 3600, 240: 14400, 1440: 86400}
+
+    def __init__(self, broker_offset_hours: float = 0.0):
+        # v3.3.0: what the BROKER SERVER's clock reads. 0.0 keeps every pre-existing contract test unchanged.
+        self.broker_offset_hours = broker_offset_hours
+        self.tick_epoch_utc = self.TICK_EPOCH_UTC          # override to pin the mock's tick to a chosen UTC instant
         self.trade_mode = self.ACCOUNT_TRADE_MODE_DEMO; self.retcode = self.TRADE_RETCODE_DONE
         self.position = SimpleNamespace(ticket=77, symbol="XAUUSD", magic=12001, volume=.10, type=0, sl=2490.0, tp=0.0)
         self.last_request = None
@@ -28,8 +34,20 @@ class MockMT5:
                                trade_allowed=True, trade_mode=self.trade_mode, margin_mode=self.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
     def symbol_info(self, symbol):
         return SimpleNamespace(visible=True, trade_mode=4, point=.01, trade_stops_level=0, trade_freeze_level=0,
-                               filling_mode=self.SYMBOL_FILLING_IOC)
-    def symbol_info_tick(self, symbol): return SimpleNamespace(time=1788532800, bid=2500.0, ask=2500.2)
+                               filling_mode=self.SYMBOL_FILLING_IOC,
+                               volume_min=.01, volume_step=.01, volume_max=100.0)
+    def terminal_info(self):
+        return SimpleNamespace(connected=True, trade_allowed=True)
+    def _broker_epoch(self) -> int:
+        """MT5 hands back the broker server's wall clock, as epoch seconds."""
+        return int(self.tick_epoch_utc + self.broker_offset_hours * 3600)
+    def symbol_info_tick(self, symbol):
+        return SimpleNamespace(time=self._broker_epoch(), bid=2500.0, ask=2500.2)
+    def copy_rates_from_pos(self, symbol, timeframe, start, count):
+        step = self.BAR_SECONDS[timeframe]
+        end = self._broker_epoch() - self._broker_epoch() % step          # newest bar open, in broker time
+        return [{"time": end - (count - 1 - i) * step, "open": 2500.0 + i, "high": 2500.5 + i,
+                 "low": 2499.5 + i, "close": 2500.2 + i, "tick_volume": 100} for i in range(count)]
     def symbol_select(self, symbol, selected): return True
     def positions_get(self, symbol=None, ticket=None):
         if ticket is not None: return (self.position,) if self.position and self.position.ticket == ticket else ()
@@ -54,8 +72,8 @@ class MockMT5:
                                 time=int(end.timestamp()) - 1, reason=self.DEAL_REASON_SL, volume=.1),)
 
 
-def _client(monkeypatch):
-    fake = MockMT5(); monkeypatch.setattr(adapter, "mt5", fake)
+def _client(monkeypatch, broker_offset_hours: float = 0.0):
+    fake = MockMT5(broker_offset_hours); monkeypatch.setattr(adapter, "mt5", fake)
     return fake, adapter.MT5Client()
 
 

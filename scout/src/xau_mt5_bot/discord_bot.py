@@ -1,4 +1,4 @@
-"""Read-only Discord command bot (v3.1.0).
+"""Read-only Discord command bot (v3.3.0).
 
 Runs as a SEPARATE process next to the trading bot and answers `!commands` from the bot's own files:
 
@@ -28,11 +28,11 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from .cards import detections_card, status_card
+from .cards import blocked_by_text, decision_card, detections_card, status_card, why_text
 
 HELP = (
-    "`!why` (`!decide`) full gate table: verdict, every gate, what would flip it · `!clock` broker time offset and clock guard\n"
-    "`!status` GO/NO-GO card · `!detected` patterns/structure/sweeps/zones card · `!text` old status block · `!plan` entry/SL/TP/RR · `!silver` XAU/XAG correlation + SMT · `!scouts` session pair\n"
+    "`!status` the decision card: verdict, gate checklist, what flips it · `!why` the same gates as text · `!clock` broker vs system time\n"
+    "`!detected` compact detections (`!detected full` for everything) · `!text` old status block · `!plan` entry/SL/TP/RR · `!silver` XAU/XAG correlation + SMT · `!scouts` session pair\n"
     "`!positions` open PA trades · `!day` realised P/L and locks · `!trades [n]` last closed trades · `!go` session GO tallies\n"
     "`!events [n]` last audit events · `!reports [n]` session/weekly reports · `!heartbeat` process health · `!help`\n"
     "Read-only. Demo bot. No order commands exist."
@@ -143,6 +143,12 @@ def _get(d: Any, *keys: str, default: Any = None) -> Any:
     return default if d is None else d
 
 
+def _zone_text(zone: Any) -> str:
+    if not zone:
+        return "none"
+    return f"{_f(zone.get('low'))}–{_f(zone.get('high'))} ({zone.get('kind')})"
+
+
 # ---- command formatters (pure functions; tested without Discord) -----------------------------------------------------
 def fmt_status(state: BotState) -> str:
     s = state.latest_snapshot()
@@ -157,14 +163,14 @@ def fmt_status(state: BotState) -> str:
     tgt = _get(s, "analysis", "session_target", default={})
     mtf = _get(s, "analysis", "multi_timeframe", default={})
     zone = (s.get("zones") or [None])[0]
-    zone_text = f"{_f(zone.get('low'))}–{_f(zone.get('high'))} ({zone.get('kind')})" if zone else "none"
     lines = [
         f"**[{s.get('go_status')}] [{_get(s, 'decision', 'action')}]** {ts}{stale} · {s.get('session')} · {_f(s.get('bid'))}/{_f(s.get('ask'))} spread {_f(s.get('spread'))} · data {s.get('freshness')}",
         f"PA {s.get('pa_side') or 'NEUTRAL'} · confluence {s.get('confluence')}/100 · D1 {_get(st, 'D1', 'state')} H4 {_get(st, 'H4', 'state')} H1 {_get(st, 'H1', 'state')} M15 {_get(st, 'M15', 'state')} M5 {_get(st, 'M5', 'state')}",
         f"MTF {mtf.get('label', 'n/a')} · target {tgt.get('target_verdict', 'n/a')} · {_f(_get(s, 'analysis', 'remaining_session_minutes'), 0)} min left · calibration {_get(s, 'reporting', 'calibration_status', default='n/a')}",
         f"Scouts: leader {sc.get('leader')} · BUY {_f(sc.get('buy_pnl'))} · SELL {_f(sc.get('sell_pnl'))} · {sc.get('verdict')} {sc.get('strength')}/10 · pace {sc.get('market_speed')}",
         f"Silver: {im.get('regime', 'n/a')} r={im.get('correlation')} · SMT {im.get('smt', 'NONE')} · leading {im.get('silver_leading', 'NONE')} · +{im.get('long_points', 0)}L/+{im.get('short_points', 0)}S",
-        f"Entry: {zone_text} · {s.get('entry_state')} · trigger {'CONFIRMED' if _get(s, 'trigger', 'confirmed') else 'waiting'} — {_get(s, 'trigger', 'reason')}",
+        f"Entry: {_zone_text(zone)} · {s.get('entry_state')} · trigger {'CONFIRMED' if _get(s, 'trigger', 'confirmed') else 'waiting'} — {_get(s, 'trigger', 'reason')}",
+        f"Blocked by: {blocked_by_text(s)}",
         f"Reason: {_get(s, 'decision', 'reason')}",
     ]
     return "\n".join(lines)
@@ -320,61 +326,51 @@ def fmt_heartbeat(state: BotState) -> str:
 
 
 def fmt_why(state: BotState) -> str:
-    """v3.3.0: the whole router gate table for the latest cycle — why it is a NO-GO, and what would change it."""
+    """v3.4.0: the gate checklist and what would flip the blocking one, from the same decision trace."""
     s = state.latest_snapshot()
     if not s:
-        return "No snapshot yet — is the trading bot running?"
-    trace = _get(s, "analysis", "decision_trace", default={}) or {}
-    if not trace:
-        return (f"This snapshot predates v3.3.0, so there is no gate table. Router said: "
-                f"{_get(s, 'decision', 'action')} — {_get(s, 'decision', 'reason')}")
-    lines = [f"**[{s.get('go_status')}] {trace.get('verdict')}**",
-             f"{state.local(s.get('timestamp'))} · {s.get('session')} · {trace.get('passed_count')}/{trace.get('gate_count')} gates passed",
-             "```"]
-    for gate in trace.get("gates") or []:
-        mark = "PASS" if gate.get("passed") else "FAIL"
-        threshold = f" (need {gate['threshold']})" if gate.get("threshold") not in (None, "") else ""
-        lines.append(f"{mark:4} {str(gate.get('name'))[:22]:22} {str(gate.get('value'))[:28]:28}{threshold}")
-    lines.append("```")
-    if trace.get("next"):
-        lines.append("**What would flip it**\n" + "\n".join(f"• {item}" for item in trace["next"][:6]))
-    evidence = trace.get("evidence") or {}
-    for label in ("long", "short"):
-        items = evidence.get(label) or []
-        if items:
-            lines.append(f"{label.upper()} evidence ({evidence.get(label + '_score')}): "
-                         + ", ".join(f"{i['label']} +{i['points']}" for i in items))
-    lines.append(f"Silver: {evidence.get('silver', 'n/a')}")
-    lines.append(trace.get("go_meaning", ""))
-    return "\n".join(x for x in lines if x)
+        return "No snapshot yet."
+    trace = _get(s, "analysis", "decision_trace", default=None)
+    if not trace:                                                   # pre-v3.4.0 snapshot
+        header = f"**[{s.get('go_status')}] [{_get(s, 'decision', 'action')}]** {state.local(s.get('timestamp'))} · {s.get('session')}"
+        return f"{header}\n{why_text(s)}\nRouter reason: {_get(s, 'decision', 'reason')}"
+    lines = [f"**{trace.get('title')}**", trace.get("sentence", ""), ""]
+    for g in trace.get("gates") or []:
+        lines.append(f"{g.get('mark')} **{g.get('label')}** · {g.get('value')}")
+    flips = trace.get("flips") or []
+    lines.append("")
+    lines.append("**What flips it**")
+    lines.extend(f"{i}. {f}" for i, f in enumerate(flips, 1)) if flips else lines.append("Nothing is blocking — the gates are clear.")
+    return "\n".join(x for x in lines if x is not None)
 
 
 def fmt_clock(state: BotState) -> str:
-    """v3.3.0: system UTC, broker time, detected offset, residual skew and the guard's verdict."""
+    """v3.3.0: system UTC, broker time, detected offset, residual skew and whether the order guard is open."""
     s = state.latest_snapshot() or {}
-    clock = _get(s, "analysis", "broker_clock", default={}) or {}
     hb = state.heartbeat() or {}
-    if not clock and hb.get("broker_utc_offset_hours") is not None:
-        clock = {"broker_utc_offset_hours": hb.get("broker_utc_offset_hours"),
-                 "residual_skew_seconds": hb.get("broker_clock_residual_seconds"),
-                 "broker_clock_source": hb.get("broker_clock_source"), "clock_ok": hb.get("broker_clock_ok"),
-                 "broker_server": hb.get("broker_server")}
+    clock = _get(s, "analysis", "broker_clock", default=None) or hb.get("broker_clock") or {}
     if not clock:
-        return "No broker clock reading yet — start the trading bot (v3.3.0 or newer)."
+        return "No broker clock reading yet — the trading bot has not completed a cycle."
     now = datetime.now(UTC)
-    hours = float(clock.get("broker_utc_offset_hours") or 0)
-    broker_now = now + timedelta(hours=hours)
-    residual = clock.get("residual_skew_seconds", clock.get("broker_clock_residual_seconds"))
-    limit = clock.get("max_clock_skew_seconds", 600)
-    ok = clock.get("clock_ok")
-    return "\n".join([
-        f"**Broker clock** {'✅ orders allowed' if ok else '⛔ orders blocked by the clock guard'}",
-        f"System UTC: {now.strftime('%Y-%m-%d %H:%M:%S')} · local {now.astimezone(state.tz).strftime('%H:%M:%S %Z')}",
-        f"Broker time: {broker_now.strftime('%Y-%m-%d %H:%M:%S')} (server {clock.get('broker_server') or 'n/a'})",
-        f"Detected offset: UTC{hours:+g}h ({clock.get('broker_clock_source', 'auto')})",
-        f"Residual skew: {_f(residual, 1)}s · limit {limit}s",
-        "The offset is applied to every tick and bar before analysis, so only the residual can block orders.",
-    ])
+    offset = float(clock.get("offset_hours") or 0.0)
+    residual = float(clock.get("residual_seconds") or 0.0)
+    limit = _get(s, "analysis", "blocked_by", default=None)
+    guard = "BLOCKED" if any(i.get("veto") == "clock" for i in (limit or [])) else "OPEN"
+    # What the broker's clock actually reads = our clock + its timezone + whatever the two disagree by.
+    # Using the offset alone would hide exactly the skew this command exists to show.
+    broker_now = now + timedelta(hours=offset, seconds=residual)
+    lines = [
+        f"**Broker clock** · guard {guard}",
+        f"System UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}Z",
+        f"Broker server time: {broker_now.strftime('%Y-%m-%d %H:%M:%S')} (UTC{offset:+g} + {residual:+.0f}s skew) · server {clock.get('server') or 'n/a'}",
+        f"Detected offset: UTC{offset:+g} ({clock.get('source', 'auto')}) · measured {state.local(clock.get('measured_at'))}",
+        f"Residual skew after removing the offset: {residual:.0f}s · raw tick-vs-system delta {clock.get('raw_delta_seconds')}s",
+    ]
+    if clock.get("confident") is False:
+        lines.append(f"⚠ The raw delta sat {abs(residual):.0f}s from the nearest half-hour, so the detected offset may have "
+                     f"absorbed real drift. Check the PC clock, or pin `safety.broker_utc_offset_hours`.")
+    lines.append("MT5 reports tick and bar times in broker-server time; the bot converts them to UTC and only the residual counts as skew.")
+    return "\n".join(lines)
 
 
 def _age_seconds(iso: str | None) -> float | None:
@@ -400,14 +396,15 @@ def dispatch(state: BotState, text: str, prefix: str = "!") -> str | dict[str, A
         return None
     cmd, args = parts[0].lower(), parts[1:]
     try:
-        if cmd == "status":
+        if cmd in {"status", "decision"}:
             snap = state.latest_snapshot()
-            return status_card(snap, str(state.tz)) if snap else fmt_status(state)   # embed card (v3.2.0)
+            return decision_card(snap, str(state.tz)) if snap else fmt_status(state)   # THE card (v3.4.0)
         if cmd in {"detected", "patterns", "seen"}:
             snap = state.latest_snapshot()
-            return detections_card(snap, str(state.tz)) if snap else "No snapshot yet."
-        if cmd in {"why", "decide", "explain"}: return fmt_why(state)
-        if cmd in {"clock", "time", "offset"}: return fmt_clock(state)
+            full = bool(args) and str(args[0]).lower() in {"full", "all", "long"}
+            return detections_card(snap, str(state.tz), full=full) if snap else "No snapshot yet."
+        if cmd in {"why", "blocked"}: return fmt_why(state)
+        if cmd in {"clock", "time"}: return fmt_clock(state)
         if cmd == "text": return fmt_status(state)
         if cmd == "plan": return fmt_plan(state)
         if cmd in {"silver", "xag", "smt"}: return fmt_silver(state)

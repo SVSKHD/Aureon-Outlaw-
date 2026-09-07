@@ -56,34 +56,25 @@ class SafetyConfig(BaseModel):
     one_pa_position_per_symbol: bool = True
     max_m1_age_seconds: int = Field(default=300, ge=60)
     retry_count: int = Field(default=1, ge=0, le=3)
-    # v3.3.0: null = auto-detect the MT5 server timezone from its own ticks. A number pins it
-    # (whole or half hours). broker_timestamp_offset_seconds is the older manual-only form and is
-    # still honoured when the hours override is null; the hours override wins when both are set.
-    broker_utc_offset_hours: float | None = Field(default=None, ge=-14, le=14)
-    broker_timestamp_offset_seconds: int = Field(default=0, ge=-50400, le=50400)
-    max_clock_skew_seconds: int = Field(default=600, ge=60)   # residual skew AFTER the broker offset is applied
+    max_clock_skew_seconds: int = Field(default=600, ge=60)
+    # v3.3.0: MT5 reports tick/bar times in the BROKER SERVER timezone. null = auto-detect the offset each
+    # hour and quantise it to the nearest 30 min; a float pins it (e.g. 3.0 for a UTC+3 server).
+    broker_utc_offset_hours: float | None = Field(default=None, ge=-24.0, le=24.0)
+    # Legacy seconds form of the same pin (master PR #2/#3). Honoured only when the hours form is null;
+    # 0 means "use auto-detection", so the shipped default changes nothing.
+    broker_timestamp_offset_seconds: float | None = Field(default=None, ge=-86400.0, le=86400.0)
+    broker_offset_remeasure_seconds: int = Field(default=3600, ge=60)
+
+    @model_validator(mode="after")
+    def _fold_legacy_offset(self) -> "SafetyConfig":
+        if self.broker_utc_offset_hours is None and self.broker_timestamp_offset_seconds:
+            self.broker_utc_offset_hours = float(self.broker_timestamp_offset_seconds) / 3600.0
+        return self
     transition_retry_limit: int = Field(default=5, ge=0)
     repair_missing_scout_leg: bool = True
     scout_repair_max_session_fraction: float = Field(default=0.5, ge=0, le=1)
     broker_market_stale_seconds: int = Field(default=180, ge=30)
     deal_history_max_days: int = Field(default=3650, ge=90)
-
-
-    @model_validator(mode="after")
-    def broker_offset_is_a_real_timezone(self) -> "SafetyConfig":
-        """A manual override must be a whole or half hour — MT5 server timezones always are (v3.3.0)."""
-        if self.broker_utc_offset_hours is not None and abs(self.broker_utc_offset_hours * 2 - round(self.broker_utc_offset_hours * 2)) > 1e-9:
-            raise ValueError("safety.broker_utc_offset_hours must be a whole or half hour (e.g. 3, 2.5, -5), or null to auto-detect")
-        return self
-
-    @property
-    def manual_broker_offset_hours(self) -> float | None:
-        """The effective manual override: the hours key, else the legacy seconds key, else None (auto-detect)."""
-        if self.broker_utc_offset_hours is not None:
-            return float(self.broker_utc_offset_hours)
-        if self.broker_timestamp_offset_seconds:
-            return self.broker_timestamp_offset_seconds / 3600.0
-        return None
 
 
 class MagicConfig(BaseModel):
@@ -168,7 +159,8 @@ class IntegrationsConfig(BaseModel):
     discord_min_interval_seconds: int = 300
     # v3.1.1 — status pushes: "events" = never push the status block (use !status), "changes" = only when the
     # decision/entry-state/PA side/session changes, "interval" = changes + one status every discord_min_interval_seconds.
-    discord_status_mode: str = Field(default="hourly", pattern="^(events|changes|interval|hourly|off)$")
+    # v3.4.0: `hourly` pushes the decision card once an hour AND immediately on any decision change (master PR #3).
+    discord_status_mode: str = Field(default="events", pattern="^(events|changes|interval|hourly|off)$")
     # v3.1.1 — event set: "trade" = lifecycle + risk events only; "all" = every eligible audit event (v3.0 behaviour).
     discord_event_level: str = Field(default="trade", pattern="^(trade|all)$")
     firebase_key_path: str = "serviceAccountKey.json"

@@ -105,38 +105,61 @@ Conservative extension points (not claimed as production-calibrated):
 
 See `EXAMPLE_REPORTS.md` for LONG, SHORT, WAIT and active-position output examples.
 
-## v3.3.0 — broker clock offset + a readable decision (Sep 7 2026)
+## v3.4.0 — the decision card (Sep 7 2026)
 
-- **Root cause of "scouts are never placed"**: MT5 reports tick and bar times in the BROKER SERVER
-  timezone. A UTC+3 server therefore looked like a permanent 10 799 s clock skew, and the clock guard
-  blocked every order. `mt5_client.BrokerClock` now detects that offset (nearest 30 min, re-measured
-  hourly and on reconnect, DST steps only after the first detection) and applies it to every tick,
-  bar and deal time, so the rest of the bot works in true UTC. The guard acts on the RESIDUAL skew,
-  which is the real fault. `safety.broker_utc_offset_hours: null` auto-detects; a whole/half-hour
-  value pins it (as does the older `broker_timestamp_offset_seconds`). Detection is narrow on
-  purpose: only a difference within 120 s of a whole/half hour counts as a timezone, so a wrong PC
-  clock is never absorbed — it still blocks orders. Merged with the manual-offset work from PR #2.
-- **The decision explains itself**: `snapshot.analysis.decision_trace` carries a one-sentence verdict,
-  all 17 router gates in order with value/threshold, what would flip each failed gate, and the three
-  strongest confluence families per side. Printed every cycle, on the status card
-  (Verdict / Blocked by / Next), and in SQLite/Firestore.
-- **Cards tell the whole story**: SCOUTS NOT PLACED maps the reason text to a concrete fix and shows
-  the detected offset, attempt number and next retry; PLACED/ROLLED BACK/CLOSED/ADOPTED carry both
-  tickets, entries, P/L, MFE/MAE and verdict strength; a real ORDER PLACED card now exists (the event
-  was listed but never emitted); management cards show realised P/L, remaining volume and the new SL;
-  the Detected card collapses `ROUND_1 ×N` and shows zone distance in ATR.
-- **New read-only commands**: `!why` (alias `!decide`) full gate table, `!clock` broker time and offset.
-  Still no order commands, by design.
-- Fixed a Python 3.11 f-string syntax error in `cards.py` / `discord_bot.py` that made the package
-  unimportable on the supported runtime. Added `.gitignore`; `__pycache__` is no longer committed.
-- 275 passing tests. See `RELEASE_NOTES_v3.3.0.md`.
+One card answers "go or not" in a glance. `decision_router.explain_decision()` builds a `DecisionExplanation`
+once per cycle, the engine stores it as `analysis.decision_trace`, and the webhook, `!status` and `!why` all
+render the same thing. No strategy weight or threshold changed — the trace only reports the decision already made.
+
+- **Gate checklist**: fourteen gates in evaluation order — data, clock+account, spread, confluence, side gap,
+  zone, trigger, pace, scouts, RR, target, $ session target, risk locks, session time — each with its measured
+  value against its threshold. Exactly one row can be `❌`: the **first** gate that fails. Rows before it are
+  `✅`, rows after are `—`, because the router never got that far.
+- **Verdict**: `PLACED` (green, with ticket and lot), `GO` (green, every gate clear but nothing sent),
+  `WAIT` (amber, setup alive), `NO_TRADE` (red), `CLOSED` (grey).
+  Titles read `🟠 WAIT · LONG bias 58/100 · inside zone, trigger pending · ASIA · 05:00`.
+- **Verdict sentence** in ≤ 30 words with the numbers; **What flips it** as up to 3 concrete numbered
+  conditions; **Evidence** split FOR/AGAINST by confluence family and applied penalty; **Levels** (price,
+  zone, SL, TP1 with R); **Footer** with today's GO tally and what would still block once price reaches the zone.
+- Order cards reuse the skeleton (ticket/lot title, entry + risk + every TP with R, the five gates cleared,
+  the management plan, silver footer). The Detected card is now compact — structure strip, 3 newest patterns,
+  3 newest sweeps on the bias side, zones in ATR — with `!detected full` for everything.
+- 269 passing tests. See `RELEASE_NOTES_v3.4.0.md`.
+
+## v3.3.0 — broker clock offset + self-explanatory cards (Sep 7 2026)
+
+**Why scouts were never placed.** MetaTrader5 reports `symbol_info_tick().time`, `copy_rates_*()['time']`, deal times
+and position times as epoch seconds of the **broker server's wall clock**, not UTC. Read as UTC, a UTC+3 broker looked
+like a 10 799 s clock skew, so the order guard refused every scout and PA order forever — and every bar timestamp was
+three hours into the future, which also broke session attribution, freshness, sweep ages and the times on the cards.
+
+- `mt5_client.BrokerClock` is now the single conversion point. At startup and at most once an hour (plus on every
+  reconnect) it measures `(broker tick time read as UTC) − system UTC` and rounds it to the nearest 30 minutes — that is
+  the broker's timezone. `get_tick()`, `get_bars()`, deal history and position open times all pass through it, so
+  everything downstream sees true UTC.
+- The clock guard now reads only the **residual** skew left after removing that offset, against
+  `safety.max_clock_skew_seconds`. A UTC+3 broker with a correct PC clock trades; a PC clock 25 minutes out still blocks,
+  and the message names the offset that was already removed.
+- `safety.broker_utc_offset_hours` (default `null` = auto-detect) pins a known server. A manual pin always wins and is
+  never replaced by a later measurement. **Nothing in `config.yaml` needs changing for auto-detect.**
+- Discord cards carry the whole story: SCOUTS NOT PLACED maps the reason text (clock skew, spread, margin, netting, day
+  lock, live account…) and shows the detected offset, spread vs limit, free vs required margin, attempt number and next
+  retry; SCOUTS PLACED / ROLLED BACK / CLOSED / ADOPTED carry tickets, entries, P/L, MFE/MAE, leader and verdict; order
+  cards carry the full plan and every management card shows realised P/L, remaining volume and the new SL.
+- `!status` and the status card gain a **Blocked by** field listing every active router veto in evaluation order, so a
+  NO-GO explains itself. New read-only commands `!why` (what would flip each veto) and `!clock` (system UTC, broker
+  time, detected offset, residual skew, guard status). Still no order commands, by design.
+- The Detected card collapses ROUND_1 sweeps (`ROUND_1 ×3 (4407.00–4409.00)`), dedupes identical level+price, keeps the
+  6 newest sweeps and 2 newest structure events per timeframe, and shows zone distance in ATR.
+- Repository layout fixed to the src-layout `pyproject.toml` already described (`src/xau_mt5_bot/`, `tests/`).
+- 253 passing tests. See `RELEASE_NOTES_v3.3.0.md`.
 
 ## v3.1.0 — silver correlation + Discord commands (Sep 6 2026)
 
 - `intermarket.py`: XAU/XAG rolling correlation, relative strength and M15 SMT divergence as a capped (8-point) confluence family,
   active only while the metals are COUPLED (r ≥ 0.50). Evidence only; degrades to UNAVAILABLE without blocking a cycle.
-- `discord_bot.py` + `run_discord_bot.bat`: read-only command bot (`!status !why !clock !detected !plan !silver !scouts !positions !day !trades !go
-  !events !reports !heartbeat`). Needs `DISCORD_BOT_TOKEN` in `.env`, `pip install -e ".[discord]"`, Message Content Intent on.
+- `discord_bot.py` + `run_discord_bot.bat`: read-only command bot (`!status !plan !silver !scouts !positions !day !trades !go
+  !events !reports !heartbeat !why !clock`). Needs `DISCORD_BOT_TOKEN` in `.env`, `pip install -e ".[discord]"`, Message Content Intent on.
 - 212 passing tests. See `RELEASE_NOTES_v3.1.0.md`.
 
 ## v3.0.0 — demo-only analysis & validation build (Sep 6 2026)

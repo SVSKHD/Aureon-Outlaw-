@@ -4,8 +4,6 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime
-from zoneinfo import ZoneInfo
 import urllib.request
 import urllib.error
 from typing import Any
@@ -17,21 +15,23 @@ from .cards import detection_signature, detections_card, event_card, snapshot_di
 class Discord:
     TRADE_EVENTS: frozenset = frozenset({"startup", "startup_failed", "shutdown", "restart", "cycle_error", "integration_disabled",
                    "session_transition", "session_summary", "weekly_report", "next_week_open_report",
-                   "scout_session_open", "scout_session_close", "scout_rollback", "scout_stale_pair_closed", "scout_adopted",
-                   "broker_clock_offset", "order", "order_withheld", "pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close", "trade_closed",
-                   "strong_scout_contradiction", "smt_divergence", "state_file_recovered", "scout_open_failed"})               # v3.1.1: quiet default
+                   "scout_session_open", "scout_session_close", "scout_rollback", "scout_stale_pair_closed",
+                   "order", "order_withheld", "pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close", "trade_closed",
+                   "pa_breakeven_retry", "pa_tp2_lock_retry",
+                   "strong_scout_contradiction", "smt_divergence", "state_file_recovered", "scout_open_failed",
+                   # v3.3.0: restart adoption and a changed broker clock offset are both rare and operationally important
+                   "scout_adopted", "scout_leg_repaired", "broker_clock_offset"})                                    # v3.1.1: quiet default
 
     def __init__(self, webhook_env: str, min_interval: int = 300, scout_pair_min_interval: int = 60,
                  retry_count: int = 3, retry_backoff_seconds: float = 1.0,
-                 status_mode: str = "hourly", event_level: str = "trade", display_timezone: str = "UTC") -> None:
-        self.display_timezone = display_timezone                                              # v3.3.0: event cards render local times
+                 status_mode: str = "events", event_level: str = "trade") -> None:
         self.status_mode, self.event_level = status_mode, event_level                         # v3.1.1
         self.url = os.environ.get(webhook_env, "") or os.environ.get("DISCORD_WEBHOOK_URL", "")     # v3.1.0: accept the common alias
         self.min_interval = min_interval
-        self._last_hour: str | None = None
         self._last_status = 0.0
         self._last_key: str | None = None
         self._last_detection_sig: str | None = None; self._last_detection_push = 0.0                 # v3.2.0
+        self._last_hour: int | None = None                                                           # v3.4.0
         self.scout_pair_min_interval = scout_pair_min_interval
         self._last_pair_event: dict[str, float] = {}
         self.retry_count = retry_count
@@ -96,24 +96,23 @@ class Discord:
 
     def on_snapshot(self, s: AnalysisSnapshot, tz: str) -> None:
         """Send immediately when the decision/entry-state changes; otherwise at most one status per min_interval."""
-        if self.status_mode == "off":
-            return
         d = snapshot_dict(s); now = time.time()
-        hour = None
-        if self.status_mode == "hourly":
-            stamp = datetime.fromisoformat(str(d["timestamp"])).astimezone(ZoneInfo(tz))
-            hour = stamp.replace(minute=0, second=0, microsecond=0).isoformat()
         sig = detection_signature(d)                                                                # v3.2.0: detections card on new detection
         if self._last_detection_sig is not None and sig != self._last_detection_sig and now - self._last_detection_push >= 60 and self.status_mode != "off":
             if self.send(embed=detections_card(d, tz)):
                 self._last_detection_push = now
         self._last_detection_sig = sig
-        if self.status_mode == "events":
-            return                                                                                   # v3.1.1: status only on request (!status)
-        key = f"{s.decision.action.value}|{s.entry_state.value}|{s.pa_side}|{s.session.value}|{s.go_status}"
-        scout = d.get("scout") or {}
-        key += f"|{scout.get('verdict')}|{bool(scout.get('buy_ticket') and scout.get('sell_ticket'))}"
-        if key != self._last_key or (self.status_mode == "hourly" and hour != self._last_hour) or (self.status_mode == "interval" and now - self._last_status >= self.min_interval):
+        if self.status_mode in {"events", "off"}:
+            return                                                     # v3.1.1: status only on request (!status)
+        # v3.4.0: the decision card is pushed when the VERDICT or the blocking gate changes, not just the action.
+        trace = ((d.get("analysis") or {}).get("decision_trace") or {}) if isinstance(d, dict) else {}
+        key = (f"{s.decision.action.value}|{s.entry_state.value}|{s.pa_side}|{s.session.value}|{s.go_status}"
+               f"|{trace.get('verdict')}|{trace.get('blocking_gate')}")
+        hour = int(now // 3600)                                        # v3.4.0: `hourly` = one card an hour, plus every change
+        due = (key != self._last_key
+               or (self.status_mode == "hourly" and hour != self._last_hour)
+               or (self.status_mode == "interval" and now - self._last_status >= self.min_interval))
+        if due:
             if self.send(embed=status_card(d, tz)):
                 self._last_key, self._last_status, self._last_hour = key, now, hour
 
@@ -127,7 +126,8 @@ class Discord:
                    "order_withheld", "state_file_recovered", "research_translation", "session_transition_delayed", "session_summary_recovered",
                    "pending_report_dropped", "startup_failed", "mt5_validated", "setup_outcome_resolved", "strong_scout_contradiction",
                    "scout_pending_stats_dropped", "shutdown_discord_pending",
-                   "smt_divergence", "intermarket_unavailable", "scout_open_failed"})                                                    # v3.1.0
+                   "smt_divergence", "intermarket_unavailable", "scout_open_failed",
+                   "broker_clock_offset", "broker_clock_error", "scout_leg_rolled_back"})     # v3.3.0                                                    # v3.1.0
 
     def is_eligible(self, kind: str) -> bool:
         if kind not in self.ELIGIBLE_EVENTS:
@@ -146,10 +146,11 @@ class Discord:
             if now - self._last_pair_event.get(key, 0) < self.scout_pair_min_interval:
                 return False
             self._last_pair_event[key] = now
-            return self.send(embed=event_card(kind, payload, self.display_timezone))
+            return self.send(embed=event_card(kind, payload))
         elif kind in {"session_transition", "order", "order_withheld", "pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close",
-                      "trade_closed", "smt_divergence", "cycle_error", "startup_failed", "session_summary"}:
-            return self.send(embed=event_card(kind, payload, self.display_timezone))                     # v3.2.0 cards
+                      "trade_closed", "smt_divergence", "cycle_error", "startup_failed", "session_summary",
+                      "pa_breakeven_retry", "pa_tp2_lock_retry"}:
+            return self.send(embed=event_card(kind, payload))                                        # v3.2.0 cards
         elif kind == "session_summary_legacy":
             sc = payload.get("scout", {})
             return self.send(f"**SESSION SUMMARY — {payload.get('session')} — {payload.get('go', 'NO-GO')} — {payload.get('report_status', 'COMPLETE')}**\nPA trades {payload.get('pa_trades', 0)} · W/L {payload.get('wins', 0)}/{payload.get('losses', 0)} · net {payload.get('net_pnl', 0):+.2f}\n"
@@ -180,6 +181,9 @@ class Discord:
         elif kind == "session_summary_recovered":
             return self.send(f"**RECOVERY** · {payload.get('count')} session summary(ies) recovered after restart")
         elif kind == "mt5_validated":
-            return self.send(f"**MT5 ATTACHED** · account {payload.get('login')}@{payload.get('server')} · demo={payload.get('is_demo')} hedging={payload.get('is_hedging')} · algo={payload.get('algo_trading')} · tick age {payload.get('tick_age_seconds')}s")
+            offset = payload.get("broker_utc_offset_hours")
+            clock_text = (f" · broker clock UTC{offset:+g} ({payload.get('broker_clock_source', 'auto')}), residual skew "
+                          f"{payload.get('broker_clock_residual_seconds')}s") if offset is not None else ""
+            return self.send(f"**MT5 ATTACHED** · account {payload.get('login')}@{payload.get('server')} · demo={payload.get('is_demo')} hedging={payload.get('is_hedging')} · algo={payload.get('algo_trading')} · tick age {payload.get('tick_age_seconds')}s{clock_text}")
         else:
-            return self.send(embed=event_card(kind, payload, self.display_timezone))
+            return self.send(embed=event_card(kind, payload))

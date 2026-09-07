@@ -43,6 +43,36 @@ trading loop is not started. Keep `serviceAccountKey.json` private. Confirm in `
 - `max_consecutive_losses: 3`
 - `emergency_scout_sl_price: 20.0`
 
+### Broker server time is not UTC (v3.3.0)
+
+MetaTrader 5 reports tick and bar timestamps as epoch seconds of the **broker server's own wall clock**. Most brokers
+run their servers on UTC+2 / UTC+3 (some on UTC+1, UTC+5:30 and so on), so those numbers are *not* UTC.
+
+The bot detects that offset automatically at startup and re-checks it at most once an hour (and immediately after any
+reconnect): it compares the broker tick time with system UTC and rounds the difference to the nearest 30 minutes. That
+rounded value is the broker's timezone; whatever is left over is treated as genuine clock skew.
+
+- Every tick time, bar time, deal time and position open time is converted to true UTC at that one point, so sessions,
+  freshness, sweep ages and every timestamp on a card are correct.
+- Orders are blocked only when the **residual** skew exceeds `safety.max_clock_skew_seconds` (600 s). If you see
+  `Scout orders blocked: broker clock skew …`, the broker timezone has *already* been removed — the PC clock is wrong.
+  Fix it on Windows: Settings → Time & language → Date & time → *Set time automatically* on, then
+  `w32tm /resync` in an elevated PowerShell. Task Scheduler and NSSM both inherit the corrected system clock.
+- **You do not normally configure anything.** `safety.broker_utc_offset_hours` defaults to `null` (auto-detect). Set a
+  float only to pin a known server:
+
+  ```yaml
+  safety:
+    broker_utc_offset_hours: 3.0        # null = auto-detect (default)
+    broker_offset_remeasure_seconds: 3600
+    max_clock_skew_seconds: 600         # genuine skew AFTER the offset is removed
+  ```
+
+  A pinned value always wins over auto-detection and is never replaced, so a wrong pin shows up as skew and blocks
+  orders rather than quietly shifting your timestamps.
+- Confirm what was detected with the `!clock` command, the `broker_clock_offset` entry in `!events`, the
+  `mt5_validated` line, or `broker_utc_offset_hours` in `data\heartbeat.json`.
+
 Before each trading week, populate `sessions.market_holidays` and `sessions.market_early_closes` from the broker's published XAUUSD schedule. Dates are New York local ISO dates; early closes use `HH:MM`.
 
 ## 4. Smoke test
@@ -54,7 +84,7 @@ xau-mt5-bot --config config.yaml
 pytest
 ```
 
-Confirm `mt5_validated` shows `is_demo: true`, `algo_trading: true`, the expected `is_hedging` value, prices and spread match MT5, and no `cycle_error` is written. The first cycle after every start or reconnect is a cold-start NO_TRADE cycle. Then run continuously:
+Confirm `mt5_validated` shows `is_demo: true`, `algo_trading: true`, a `broker_utc_offset_hours` that matches your broker's server time, the expected `is_hedging` value, prices and spread match MT5, and no `cycle_error` is written. The first cycle after every start or reconnect is a cold-start NO_TRADE cycle. Then run continuously:
 
 ```powershell
 xau-mt5-bot --config config.yaml --loop
@@ -109,35 +139,17 @@ Complete every item in `FORWARD_TEST_CHECKLIST.md` before relying on the system 
 5. `pip install -e ".[discord]"` in the same venv, then run `run_discord_bot.bat` (second Task Scheduler entry, At log on).
 6. Type `!help` in the channel. The bot only reads files; if `!status` says the snapshot is old, check `!heartbeat`.
 
-## Broker server time (v3.3.0)
+Commands (all read-only — there are deliberately no order commands):
 
-MetaTrader 5 reports tick and bar times in **its server's** timezone, which is usually not UTC —
-UTC+2/UTC+3 is the common broker setting. The bot detects that offset from the terminal itself at
-startup, re-measures it at most once an hour and on every reconnect, and converts every tick, bar and
-deal time to UTC before anything else looks at them.
+| Command | Answers |
+| --- | --- |
+| `!status` | GO / NO-GO card, including the **Blocked by** list of active router vetoes |
+| `!why` | every veto currently blocking a trade **and what would flip each one** (v3.3.0) |
+| `!clock` | system UTC, broker server time, detected offset, residual skew, guard status (v3.3.0) |
+| `!detected` | patterns, structure events, sweeps (ROUND_1 collapsed) and zones with ATR distance |
+| `!plan` `!silver` `!scouts` `!positions` `!day` | current plan, XAU/XAG evidence, scout pair, open trades, daily P/L and locks |
+| `!trades [n]` `!go` `!events [n]` `!reports [n]` `!heartbeat` | history, session GO tallies, audit events, reports, process health |
 
-* **Nothing to configure.** `safety.broker_utc_offset_hours: null` means auto-detect.
-* Pin it only if you have a reason to: `broker_utc_offset_hours: 3` for a UTC+3 server (whole or half
-  hours). A pinned value that disagrees with the server shows up as residual skew and blocks orders,
-  so a wrong value is never silent. The older `broker_timestamp_offset_seconds` still works and is
-  used whenever `broker_utc_offset_hours` is null.
-* Detection is deliberately narrow: the difference must land within 120 seconds of a whole or half
-  hour. A PC clock that is simply wrong does not look like a timezone, so it is never absorbed —
-  it blocks orders until you fix it. `tools\diagnose_clock.py` prints the raw evidence.
-* A tick that is still in the future after the offset is refused at startup, and the guard window is
-  asymmetric: a small lag is normal, a tick ahead of your clock is not.
-* `safety.max_clock_skew_seconds` (default 600) applies to the **residual** skew after the offset —
-  i.e. to a genuinely wrong Windows clock. If orders are blocked with
-  `broker clock skew … (residual after broker offset …)`, fix the PC clock:
-  **Settings → Time & language → Date & time → Set time automatically**, then **Sync now**.
-* Check it any time from Discord with `!clock` (system UTC, broker time, detected offset, residual
-  skew, guard status), or in `data/heartbeat.json` (`broker_utc_offset_hours`).
-
-## Reading a NO-GO (v3.3.0)
-
-* `!why` (or `!decide`) prints every router gate for the latest cycle — PASS/FAIL, the value, the
-  threshold — followed by what would flip each failed gate and the strongest evidence per side.
-* The same trace appears in the console under `DECISION TRACE`, and on the `!status` card as
-  **Verdict**, **Blocked by** and **Next**.
-* GO means the cycle's demo setup passed every gate. It is a signal and a session GO tally, never a
-  standing instruction to place an order.
+`!why` is the fastest way to answer "why is it not trading?" — it names the veto (spread, confluence, zone, trigger,
+SLOW, scouts, RR, target, session feasibility, clock, day lock) with the numbers behind it. `!clock` is the fastest way
+to confirm the broker offset was detected correctly.
