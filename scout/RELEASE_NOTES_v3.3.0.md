@@ -33,6 +33,11 @@ seconds of the **broker server's wall clock**. v3.2.0 read them as UTC (`mt5_cli
 - **Re-measurement.** At most once per hour, and immediately on `reconnect()` (which calls `clock.invalidate()`), so a
   broker that moves between summer and winter time is picked up without a restart. Inside that hour the offset is held
   fixed and only the residual is recomputed — that is what makes real drift visible instead of being absorbed.
+  A re-measurement adopts a new offset only when it differs by a whole hour (a real DST move); a sub-hour
+  "change" against an established offset is drift in one of the two clocks and is reported as skew, so a slow
+  PC blocks orders instead of silently shifting every timestamp. A first reading whose raw delta sits more than
+  120 s from the nearest half-hour is flagged `confident: false` on the card and in `!clock`, because one tick
+  cannot separate a UTC+3:30 broker from a UTC+3 broker with a 25-minute-slow PC.
 - **Reporting.** One `broker_clock_offset` audit event per detected offset change (hours, residual, raw delta, source,
   server). The offset also appears in the `mt5_validated` event, `data/heartbeat.json`
   (`broker_clock`, `broker_utc_offset_hours`, `broker_clock_residual_seconds`), the snapshot
@@ -89,8 +94,8 @@ root. Two nested same-quote f-strings that only parse on Python 3.12+ were rewri
 `env.example` was restored to `.env.example`.
 
 ## Verification (Linux, Python 3.11)
-- 248 tests collected, all pass: 215 pre-existing (unchanged), +23 broker clock and veto coverage, +10 Discord cards.
-- New: `tests/test_v33_broker_clock.py` (23 tests). Extended: `tests/test_v31_discord_bot.py` (9 → 19).
+- 253 tests collected, all pass: 215 pre-existing (unchanged), +28 broker clock and veto coverage, +10 Discord cards.
+- New: `tests/test_v33_broker_clock.py` (28 tests). Extended: `tests/test_v31_discord_bot.py` (9 → 19).
 - Covered: +3 h offset detected with residual < 5 s and scouts opening; a 25-minute genuine skew after the offset still
   blocking with the clock message; bar times converted so `session_at()` and freshness are right; a manual override
   winning over auto-detection and never being replaced; hourly / on-reconnect re-measurement; and a source audit that
