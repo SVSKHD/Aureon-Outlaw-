@@ -128,7 +128,9 @@ def status_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
 
 
 def _sweep_lines(sweeps: list[dict], tz: str, limit: int = 6) -> list[str]:
-    """Newest first, identical level_type+price collapsed, ROUND_1 folded into one counted line (v3.3.0)."""
+    """Newest first, identical level_type+price collapsed, ROUND_1 folded into one counted line (v3.3.0).
+    The collapsed line takes its place by the age of its newest member, so stale round levels cannot push
+    fresher sweeps out of the limit."""
     active = [sw for sw in (sweeps or []) if sw.get("active", True)]
     unique: dict[tuple, dict] = {}
     for sw in sorted(active, key=lambda x: x.get("age_bars", 0)):
@@ -136,17 +138,22 @@ def _sweep_lines(sweeps: list[dict], tz: str, limit: int = 6) -> list[str]:
         unique.setdefault(key, sw)
     ordered = sorted(unique.values(), key=lambda x: x.get("age_bars", 0))
     rounds = [sw for sw in ordered if str(sw.get("level_type")) == "ROUND_1"]
-    others = [sw for sw in ordered if str(sw.get("level_type")) != "ROUND_1"]
-    lines = []
+    entries: list[tuple[float, str]] = []
     if rounds:
         prices = sorted(float(sw.get("level_price") or 0) for sw in rounds)
         span = _f(prices[0]) if len(prices) == 1 else f"{_f(prices[0])}–{_f(prices[-1])}"
-        lines.append(f"{'▲' if rounds[0].get('direction') == 'BULLISH' else '▼'} ROUND_1 ×{len(rounds)} ({span})"
-                     f" · newest {rounds[0].get('age_bars')} bars")
-    for sw in others:
-        lines.append(f"{'▲' if sw.get('direction') == 'BULLISH' else '▼'} {sw.get('level_type')} {_f(sw.get('level_price'))}"
-                     f" → wick {_f(sw.get('sweep_price'))} ({sw.get('age_bars')} bars)")
-    return lines[:limit]
+        newest = rounds[0]
+        entries.append((newest.get("age_bars", 0),
+                        f"{'▲' if newest.get('direction') == 'BULLISH' else '▼'} ROUND_1 ×{len(rounds)} ({span})"
+                        f" · newest {newest.get('age_bars')} bars"))
+    for sw in ordered:
+        if str(sw.get("level_type")) == "ROUND_1":
+            continue
+        entries.append((sw.get("age_bars", 0),
+                        f"{'▲' if sw.get('direction') == 'BULLISH' else '▼'} {sw.get('level_type')} {_f(sw.get('level_price'))}"
+                        f" → wick {_f(sw.get('sweep_price'))} ({sw.get('age_bars')} bars)"))
+    entries.sort(key=lambda item: item[0])
+    return [line for _, line in entries[:limit]]
 
 
 def detections_card(s: dict[str, Any], tz: str, limit: int = 8) -> dict[str, Any]:
@@ -318,7 +325,8 @@ def order_card(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     colour = GREEN if side == "LONG" else RED if side == "SHORT" else BLUE
     titles = {"order": f"📥 ORDER PLACED · {side}", "order_withheld": "⛔ ORDER WITHHELD", "pa_partial": "💰 TP1 — 50% closed",
               "pa_breakeven": "🔒 SL moved to break-even", "pa_tp2_lock": "💰 TP2 — 25% closed, SL locked at TP1",
-              "pa_trail": "📈 Trailing stop moved", "pa_close": "🏁 Position closed", "trade_closed": "🏁 Trade closed"}
+              "pa_trail": "📈 Trailing stop moved", "pa_close": "🏁 Position closed", "trade_closed": "🏁 Trade closed",
+              "pa_breakeven_retry": "🔒 SL moved to break-even (retry)", "pa_tp2_lock_retry": "💰 TP2 SL lock (retry)"}
     if kind in {"order", "order_withheld"}:
         rejected = kind == "order" and payload.get("success") is False
         title = f"🔴 ORDER REJECTED · {side}" if rejected else titles[kind]
@@ -334,7 +342,8 @@ def order_card(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
                                             f"{payload.get('scout_strength', 0)}/10 (leader {payload.get('scout_leader', 'n/a')})", False),
                     ("Silver", str(payload.get("silver") or payload.get("intermarket") or "n/a"), False),
                 )}
-    if kind in {"pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close", "trade_closed"}:
+    if kind in {"pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close", "trade_closed",
+                "pa_breakeven_retry", "pa_tp2_lock_retry"}:
         return {"title": titles[kind], "color": colour,
                 "description": str(payload.get("reason") or payload.get("exit_reason") or payload.get("message") or ""),
                 "fields": _fields(
@@ -353,7 +362,8 @@ def order_card(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
 def event_card(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     if kind.startswith("scout_"):
         return scout_card(kind, payload)
-    if kind in {"order", "order_withheld", "pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close", "trade_closed"}:
+    if kind in {"order", "order_withheld", "pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close",
+                "trade_closed", "pa_breakeven_retry", "pa_tp2_lock_retry"}:
         return order_card(kind, payload)
     if kind == "session_transition":
         ok = payload.get("success", True)
@@ -373,7 +383,10 @@ def event_card(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
                 "description": str(payload.get("message", "")),
                 "fields": _fields(("Detected offset", f"UTC{float(hours):+g} ({payload.get('source', 'auto')})", True),
                                   ("Residual skew", f"{payload.get('residual_skew_seconds')}s vs limit {payload.get('max_clock_skew_seconds')}s", True),
-                                  ("Server", str(payload.get("server") or "n/a"), True))}
+                                  ("Server", str(payload.get("server") or "n/a"), True),
+                                  ("Confidence", "clean" if payload.get("confident", True) else
+                                   f"⚠ raw delta sat {abs(float(payload.get('residual_skew_seconds') or 0)):.0f}s from the "
+                                   f"nearest half-hour — pin safety.broker_utc_offset_hours if this is wrong", False))}
     if kind in {"cycle_error", "startup_failed", "integration_disabled"}:
         return {"title": f"🔴 {kind.replace('_', ' ').upper()}", "color": RED, "description": json.dumps(payload, default=str)[:1900]}
     return {"title": f"ℹ️ {kind.replace('_', ' ').upper()}", "color": GREY, "description": json.dumps(payload, default=str)[:1900]}

@@ -47,6 +47,10 @@ class OrderResult:
 
 
 OFFSET_QUANTUM_MINUTES = 30
+OFFSET_CONFIDENCE_SECONDS = 120
+"""A broker's server clock is NTP-synced, so the raw delta should land within a couple of minutes of its
+timezone. A larger leftover means the quantum picked may have absorbed genuine drift (a PC 25 minutes slow on a
+UTC+3 broker looks exactly like a correct clock on a UTC+3:30 broker), so the reading is flagged unconfident."""
 """Broker server clocks sit on whole- or half-hour UTC offsets, so the raw tick-vs-system delta is
 rounded to the nearest 30 minutes. Whatever is left over is genuine skew, not a timezone."""
 
@@ -78,6 +82,7 @@ class BrokerClock:
         self.residual_seconds: float = 0.0
         self.raw_delta_seconds: float = 0.0
         self.measured_at: datetime | None = None
+        self.offset_confident: bool = True
         self.server: str = ""
 
     # -- conversion ----------------------------------------------------------------------------
@@ -110,9 +115,16 @@ class BrokerClock:
             self.broker_utc_offset = timedelta(hours=float(self.manual_offset_hours))
             self.offset_source = "manual"
         else:
-            self.broker_utc_offset = quantize_offset(delta)
+            candidate = quantize_offset(delta)
+            # A broker timezone changes by whole hours (DST). A sub-hour "change" against an offset we already
+            # hold is drift in one of the two clocks, so keep the established offset and let it show as skew —
+            # otherwise a slow PC would be silently absorbed and every timestamp would shift with it.
+            if self.measured_at is not None and abs((candidate - self.broker_utc_offset).total_seconds()) < 3600:
+                candidate = self.broker_utc_offset
+            self.broker_utc_offset = candidate
             self.offset_source = "auto"
         self.residual_seconds = (delta - self.broker_utc_offset).total_seconds()
+        self.offset_confident = abs(self.residual_seconds) <= OFFSET_CONFIDENCE_SECONDS
         self.measured_at = now.astimezone(UTC)
         if server:
             self.server = server
@@ -129,6 +141,9 @@ class BrokerClock:
             "residual_seconds": round(self.residual_seconds, 1),
             "raw_delta_seconds": round(self.raw_delta_seconds, 1),
             "source": self.offset_source,
+            "confident": self.offset_confident,
+            "confidence_limit_seconds": OFFSET_CONFIDENCE_SECONDS,
+            "broker_time_utc": (datetime.now(UTC) + self.broker_utc_offset + timedelta(seconds=self.residual_seconds)).isoformat(),
             "server": self.server,
             "measured_at": self.measured_at.isoformat() if self.measured_at else None,
         }

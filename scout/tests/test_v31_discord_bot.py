@@ -304,9 +304,10 @@ def test_detections_card_collapses_round_sweeps_and_shows_zone_distance():
     fields = {f["name"]: f["value"] for f in card["fields"]}
     sweep_lines = fields["Active sweeps (6 newest)"].split("\n")
     assert len(sweep_lines) == 6
-    assert sweep_lines[0] == "▲ ROUND_1 ×3 (4407.00–4409.00) · newest 2 bars"        # deduped and collapsed
+    assert sweep_lines[0].startswith("▼ PDH")                                        # 1 bar old: genuinely newest
+    assert sweep_lines[1] == "▲ ROUND_1 ×3 (4407.00–4409.00) · newest 2 bars"        # deduped, collapsed, placed by age
     assert "STALE" not in fields["Active sweeps (6 newest)"]
-    assert sweep_lines[1].startswith("▼ PDH") and "PWL" not in fields["Active sweeps (6 newest)"]
+    assert "PWL" not in fields["Active sweeps (6 newest)"]                           # 50 bars old: outside the limit
     assert fields["Structure events (2 newest / TF)"].count("M5 ") == 2               # not all three
     assert "4.00 ATR away" in fields["Zones (best first, distance in ATR)"]           # |4410 - 4402| / 2.0
 
@@ -341,7 +342,7 @@ def test_why_and_clock_commands(tmp_path):
     assert "guard BLOCKED" in clock
     assert "System UTC:" in clock and "Broker server time:" in clock
     assert "UTC+3" in clock and "Broker-Demo03" in clock
-    assert "Residual skew after removing the offset: 1500.0s" in clock
+    assert "Residual skew after removing the offset: 1500s" in clock
     assert dispatch(state, "!blocked") == why and dispatch(state, "!time") == clock
     assert "`!why`" in HELP and "`!clock`" in HELP
 

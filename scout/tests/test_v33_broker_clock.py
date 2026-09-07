@@ -505,3 +505,98 @@ def test_detection_signature_moves_when_a_zone_changes():
 
     rescored = {**base, "zones": [{**base["zones"][0], "score": 8.4}]}
     assert detection_signature(rescored) == same                            # score drift alone is not a detection
+
+
+# --- review nitpicks: quantisation must not silently swallow real drift ------------------------------------------------
+def test_established_offset_is_not_moved_by_sub_hour_drift():
+    """A slow PC must show as skew, not be absorbed into a new half-hour timezone."""
+    clock = BrokerClock()
+    clean = clock.measure((ASIA_NOW + timedelta(hours=3)).timestamp(), ASIA_NOW)
+    assert clean["offset_hours"] == 3.0 and clean["confident"] is True
+
+    drifted = clock.measure((ASIA_NOW + timedelta(hours=3, seconds=1500)).timestamp(), ASIA_NOW)
+    assert drifted["offset_hours"] == 3.0                       # NOT re-quantised to 3.5
+    assert drifted["residual_seconds"] == pytest.approx(1500, abs=2)
+    assert drifted["confident"] is False
+
+    dst = clock.measure((ASIA_NOW + timedelta(hours=2)).timestamp(), ASIA_NOW)
+    assert dst["offset_hours"] == 2.0                           # a whole-hour DST change IS adopted
+    assert abs(dst["residual_seconds"]) < 5 and dst["confident"] is True
+
+
+def test_first_measurement_near_a_boundary_is_flagged_unconfident():
+    """Nothing in one tick separates 'UTC+3:30 broker' from 'UTC+3 broker, 25-min-slow PC' — say so."""
+    clock = BrokerClock()
+    info = clock.measure((ASIA_NOW + timedelta(hours=3, seconds=1500)).timestamp(), ASIA_NOW)
+    assert info["offset_hours"] == 3.5 and info["confident"] is False
+    assert abs(info["residual_seconds"]) > info["confidence_limit_seconds"]
+
+    tidy = BrokerClock().measure((ASIA_NOW + timedelta(hours=3, seconds=4)).timestamp(), ASIA_NOW)
+    assert tidy["offset_hours"] == 3.0 and tidy["confident"] is True
+
+
+def test_sweep_lines_place_collapsed_rounds_by_age():
+    """Old ROUND_1 sweeps must not consume the 6-line budget ahead of fresher sweeps."""
+    from xau_mt5_bot.cards import _sweep_lines
+    sweeps = [{"level_type": "ROUND_1", "level_price": 4400.0 + i, "sweep_price": 4400.4 + i,
+               "direction": "BULLISH", "age_bars": 40 + i, "active": True} for i in range(3)]
+    sweeps += [{"level_type": lt, "level_price": p, "sweep_price": p + 1, "direction": "BEARISH",
+                "age_bars": age, "active": True}
+               for lt, p, age in (("PDH", 4420.0, 1), ("PDL", 4380.0, 2), ("ASIA_HIGH", 4415.0, 3),
+                                  ("ASIA_LOW", 4390.0, 4), ("PWH", 4450.0, 5), ("PWL", 4350.0, 6))]
+    lines = _sweep_lines(sweeps, "UTC")
+    assert len(lines) == 6
+    assert "ROUND_1" not in "\n".join(lines)                    # 40 bars old: rightly pushed out by fresher sweeps
+    assert lines[0].startswith("▼ PDH")
+
+    fresh_rounds = [{**sw, "age_bars": 0} for sw in sweeps[:3]]
+    lines = _sweep_lines(fresh_rounds + sweeps[3:], "UTC")
+    assert lines[0] == "▲ ROUND_1 ×3 (4400.00–4402.00) · newest 0 bars"   # newest → first
+
+
+def test_management_retry_events_are_full_cards():
+    """The docs promise every management card carries P/L, remaining volume and the new SL."""
+    from xau_mt5_bot.cards import event_card
+    from xau_mt5_bot.notify import Discord
+    for kind in ("pa_breakeven_retry", "pa_tp2_lock_retry"):
+        card = event_card(kind, {"side": "LONG", "ticket": 55, "realized_pnl": 12.5,
+                                 "remaining_volume": 0.005, "new_sl": 2500.6, "r": 1.03})
+        fields = {f["name"]: f["value"] for f in card["fields"]}
+        assert fields["Realised P/L so far"] == "12.50", kind
+        assert fields["Remaining volume"] == "0.005 lot", kind
+        assert fields["New SL"] == "2500.60", kind
+        assert "retry" in card["title"].lower(), kind
+        assert Discord("NOPE", 0, 0).is_eligible(kind), kind
+
+
+def test_clock_command_reports_the_real_broker_reading(tmp_path: Path):
+    """Broker time must include the residual: showing system UTC + offset would hide the very skew !clock exists for."""
+    import json
+    import sqlite3
+    from xau_mt5_bot.config import load_config
+    from xau_mt5_bot.discord_bot import BotState, dispatch
+
+    (tmp_path / "data" / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config.yaml").write_text((ROOT / "config.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    cfg = load_config(tmp_path / "config.yaml")
+    from xau_mt5_bot.logger import AuditLogger
+    AuditLogger(cfg.logging.sqlite_path, cfg.logging.jsonl_path)
+    payload = {"timestamp": "2026-09-07T05:00:00+00:00", "session": "ASIA", "go_status": "NO-GO",
+               "decision": {"action": "NO_TRADE", "reason": "clock"},
+               "analysis": {"blocked_by": [{"veto": "clock", "detail": "residual skew 1500s > 600s",
+                                            "flips_when": "the clocks agree"}],
+                            "broker_clock": {"offset_hours": 3.0, "residual_seconds": 1500.0,
+                                             "raw_delta_seconds": 12300.0, "source": "auto", "confident": False,
+                                             "server": "Broker-Demo03", "measured_at": "2026-09-07T05:00:00+00:00"}}}
+    with sqlite3.connect(cfg.logging.sqlite_path) as con:
+        con.execute("INSERT INTO analysis_snapshots(timestamp,symbol,session,action,payload_json) VALUES(?,?,?,?,?)",
+                    (payload["timestamp"], "XAUUSD", "ASIA", "NO_TRADE", json.dumps(payload)))
+
+    reply = dispatch(BotState(tmp_path), "!clock")
+    now = datetime.now(UTC)
+    expected = (now + timedelta(hours=3, seconds=1500)).strftime("%Y-%m-%d %H:%M")
+    offset_only = (now + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M")
+    assert expected in reply and offset_only not in reply       # the 25-minute skew is visible, not hidden
+    assert "+1500s skew" in reply
+    assert "guard BLOCKED" in reply
+    assert "pin `safety.broker_utc_offset_hours`" in reply      # unconfident reading is called out

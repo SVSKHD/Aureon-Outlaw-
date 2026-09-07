@@ -17,6 +17,7 @@ class Discord:
                    "session_transition", "session_summary", "weekly_report", "next_week_open_report",
                    "scout_session_open", "scout_session_close", "scout_rollback", "scout_stale_pair_closed",
                    "order", "order_withheld", "pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close", "trade_closed",
+                   "pa_breakeven_retry", "pa_tp2_lock_retry",
                    "strong_scout_contradiction", "smt_divergence", "state_file_recovered", "scout_open_failed",
                    # v3.3.0: restart adoption and a changed broker clock offset are both rare and operationally important
                    "scout_adopted", "scout_leg_repaired", "broker_clock_offset"})                                    # v3.1.1: quiet default
@@ -139,7 +140,8 @@ class Discord:
             self._last_pair_event[key] = now
             return self.send(embed=event_card(kind, payload))
         elif kind in {"session_transition", "order", "order_withheld", "pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close",
-                      "trade_closed", "smt_divergence", "cycle_error", "startup_failed", "session_summary"}:
+                      "trade_closed", "smt_divergence", "cycle_error", "startup_failed", "session_summary",
+                      "pa_breakeven_retry", "pa_tp2_lock_retry"}:
             return self.send(embed=event_card(kind, payload))                                        # v3.2.0 cards
         elif kind == "session_summary_legacy":
             sc = payload.get("scout", {})

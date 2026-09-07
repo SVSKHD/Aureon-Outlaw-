@@ -376,6 +376,7 @@ class TradingEngine:
                 "offset_hours": offset_hours, "residual_skew_seconds": round(self.clock_skew, 1),
                 "raw_delta_seconds": info.get("raw_delta_seconds"), "source": info.get("source"),
                 "server": info.get("server"), "max_clock_skew_seconds": self.config.safety.max_clock_skew_seconds,
+                "confident": info.get("confident", True),
                 "message": (f"Broker server clock is UTC{offset_hours:+g}; all MT5 tick and bar times are converted to UTC. "
                             f"Residual skew {self.clock_skew:.0f}s."),
             })

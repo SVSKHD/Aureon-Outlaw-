@@ -343,18 +343,24 @@ def fmt_clock(state: BotState) -> str:
         return "No broker clock reading yet — the trading bot has not completed a cycle."
     now = datetime.now(UTC)
     offset = float(clock.get("offset_hours") or 0.0)
-    residual = clock.get("residual_seconds")
+    residual = float(clock.get("residual_seconds") or 0.0)
     limit = _get(s, "analysis", "blocked_by", default=None)
     guard = "BLOCKED" if any(i.get("veto") == "clock" for i in (limit or [])) else "OPEN"
-    broker_now = now + timedelta(hours=offset)
-    return "\n".join([
+    # What the broker's clock actually reads = our clock + its timezone + whatever the two disagree by.
+    # Using the offset alone would hide exactly the skew this command exists to show.
+    broker_now = now + timedelta(hours=offset, seconds=residual)
+    lines = [
         f"**Broker clock** · guard {guard}",
         f"System UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}Z",
-        f"Broker server time: {broker_now.strftime('%Y-%m-%d %H:%M:%S')} (UTC{offset:+g}) · server {clock.get('server') or 'n/a'}",
+        f"Broker server time: {broker_now.strftime('%Y-%m-%d %H:%M:%S')} (UTC{offset:+g} + {residual:+.0f}s skew) · server {clock.get('server') or 'n/a'}",
         f"Detected offset: UTC{offset:+g} ({clock.get('source', 'auto')}) · measured {state.local(clock.get('measured_at'))}",
-        f"Residual skew after removing the offset: {residual}s · raw tick-vs-system delta {clock.get('raw_delta_seconds')}s",
-        "MT5 reports tick and bar times in broker-server time; the bot converts them to UTC and only the residual counts as skew.",
-    ])
+        f"Residual skew after removing the offset: {residual:.0f}s · raw tick-vs-system delta {clock.get('raw_delta_seconds')}s",
+    ]
+    if clock.get("confident") is False:
+        lines.append(f"⚠ The raw delta sat {abs(residual):.0f}s from the nearest half-hour, so the detected offset may have "
+                     f"absorbed real drift. Check the PC clock, or pin `safety.broker_utc_offset_hours`.")
+    lines.append("MT5 reports tick and bar times in broker-server time; the bot converts them to UTC and only the residual counts as skew.")
+    return "\n".join(lines)
 
 
 def _age_seconds(iso: str | None) -> float | None:
