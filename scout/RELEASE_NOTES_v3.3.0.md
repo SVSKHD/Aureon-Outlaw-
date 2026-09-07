@@ -63,7 +63,10 @@ as skew and blocks orders rather than silently distorting timestamps. **Auto-det
   realised P/L so far, remaining volume and the new SL.
 - **Status card and `!status`** gain a **Blocked by** field listing every router veto currently active, in evaluation
   order: spread, confluence < 55, not inside zone, no trigger, SLOW, scouts contradict, RR, target, session feasibility,
-  clock, day lock. A NO-GO now explains itself.
+  clock, day lock — plus the router's own earlier rejections (consumed trigger, trigger ownership, stale M1
+  data, account safety, no valid setup) and the engine-level overrides that run after it (higher-timeframe
+  conflict, session target UNLIKELY, cold start, withheld at send). A NO-GO now explains itself, and the list
+  can never be empty while the router is refusing.
 - **Detected card** shows at most 6 newest sweeps sorted by age, dedupes identical `level_type` + price, collapses
   ROUND_1 into one line (`ROUND_1 ×3 (4407.00–4409.00)`), shows the two newest structure events per timeframe and up to
   5 zones with their distance from price in ATR.
@@ -86,8 +89,8 @@ root. Two nested same-quote f-strings that only parse on Python 3.12+ were rewri
 `env.example` was restored to `.env.example`.
 
 ## Verification (Linux, Python 3.11)
-- 242 tests collected, all pass: 215 pre-existing (unchanged), +17 broker clock, +10 Discord cards.
-- New: `tests/test_v33_broker_clock.py` (17 tests). Extended: `tests/test_v31_discord_bot.py` (9 → 19).
+- 248 tests collected, all pass: 215 pre-existing (unchanged), +23 broker clock and veto coverage, +10 Discord cards.
+- New: `tests/test_v33_broker_clock.py` (23 tests). Extended: `tests/test_v31_discord_bot.py` (9 → 19).
 - Covered: +3 h offset detected with residual < 5 s and scouts opening; a 25-minute genuine skew after the offset still
   blocking with the clock message; bar times converted so `session_at()` and freshness are right; a manual override
   winning over auto-detection and never being replaced; hourly / on-reconnect re-measurement; and a source audit that

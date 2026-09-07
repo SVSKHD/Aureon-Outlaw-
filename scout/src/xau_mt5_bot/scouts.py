@@ -309,6 +309,8 @@ class ScoutManager:
             self.audit_once("scout_session_stats", stats.get("stats_key") or f"{self.account_key}:{self.config.symbol}:{self.fingerprint}:{stats['session_id']}", stats)   # §5.2 scoped key; raises → pending kept
             self._pending_stats = None; self.calibration_sessions += 1
             self._persist()
+        if not positions:                       # nothing was open: a repeat call must not re-emit the last pair's card
+            return ScoutTransitionResult(True, f"No open {session.value} scouts to close")
         closing = self.last_closed_summary or {}
         self.audit("scout_session_close", {                                          # v3.3.0: full pair result
             "session": session.value, "magic": magic,

@@ -804,13 +804,19 @@ class TradingEngine:
             session_range_p90=ranges.get("p90"),
         ), self.config.session_target) if self.config.session_target.enabled else {"target_verdict": "DISABLED"}
         effective_target = target.get("structural_verdict") if target.get("target_verdict") == "INSUFFICIENT_HISTORY" else target.get("target_verdict")
+        overrides: dict[str, Any] = {}                              # v3.3.0: post-router vetoes, for the "Blocked by" list
         if (self.config.session_target.enabled and self.config.session_target.block_when_unlikely and effective_target == "UNLIKELY"
                 and decision.action.value in {"LONG", "SHORT"}):
+            overrides["session_target_unlikely"] = True
+            overrides["session_target_detail"] = (f"${self.config.session_target.target_price_move:.0f} session move UNLIKELY: "
+                                                  f"{target.get('target_reason')}")
             decision = Decision(Action.NO_TRADE, f"${self.config.session_target.target_price_move:.0f} session move UNLIKELY: {target.get('target_reason')}", now)
             snapshot.decision = decision
             self.logger.event("order_withheld", {**self._withheld_context(plan, selected, trigger, confluence, scout, snapshot), "reason": "session target unlikely", "setup_id": setup_id, "target": target})
         if self.config.session_target.enabled and mtf["label"] == "HIGHER_TF_CONFLICT" and decision.action.value in {"LONG", "SHORT"} \
                 and target.get("target_verdict") == "STRETCHED":
+            overrides["higher_tf_conflict"] = True
+            overrides["higher_tf_conflict_detail"] = f"MTF {mtf['label']} with a STRETCHED session target"
             decision = Decision(Action.WAIT, "Higher-timeframe conflict with a STRETCHED session target; waiting for alignment", now)
             snapshot.decision = decision
         if self.setup_tracker is not None and trigger.confirmed and pa_side is not None and setup_id:
@@ -828,6 +834,7 @@ class TradingEngine:
             "intermarket": intermarket,                                                                            # v3.1.0
         }
         if self.startup_cycle and decision.action.value in {"LONG", "SHORT"}:                                  # v2.0.0 item 7: never trade on the cold/reconnect cycle
+            overrides["cold_start"] = True
             decision = Decision(Action.NO_TRADE, "Cold start: inputs captured before the synchronous history/pattern load; re-evaluating next cycle", now)
             snapshot.decision = decision
             self.logger.event("order_withheld", {**self._withheld_context(plan, selected, trigger, confluence, scout, snapshot), "reason": "cold start cycle", "setup_id": setup_id})
@@ -837,6 +844,8 @@ class TradingEngine:
                 recheck_ok, recheck_why = self.positions.entry_allowed(self.sessions.broker_trading_date(now).isoformat(),
                                                                        self.sessions.session_at(now).value, self.client.account_state().balance)
             if not recheck_ok:
+                overrides["send_time_withheld"] = True
+                overrides["send_time_detail"] = str(recheck_why)
                 decision = Decision(Action.NO_TRADE, f"Order withheld at send: {recheck_why}", now)
                 snapshot.decision = decision
                 self.logger.event("order_withheld", {**self._withheld_context(plan, selected, trigger, confluence, scout, snapshot), "reason": recheck_why, "setup_id": setup_id})
@@ -895,6 +904,8 @@ class TradingEngine:
             "spread": round(snapshot.spread, 3), "max_spread": self.config.risk.max_spread_price,
             "remaining_minutes": remaining_minutes,
             "minimum_remaining_minutes": self.config.session_target.minimum_remaining_minutes if self.config.session_target.enabled else None,
+            "account_reason": safe_reason,
+            **overrides,
         }
         snapshot.analysis["router_vetoes"] = router_vetoes(self._decision_input, gate)
         snapshot.analysis["blocked_by"] = blocked_by(self._decision_input, gate)

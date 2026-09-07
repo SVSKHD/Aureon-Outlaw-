@@ -49,8 +49,11 @@ def final_decision_router(value: DecisionInput, now: datetime | None = None) -> 
 
 
 # --- v3.3.0: the same veto ladder, enumerated so a NO-GO explains itself -------------------------------------------
-VETO_ORDER = ("spread", "confluence", "zone", "trigger", "slow", "scouts", "rr", "target",
-              "session_feasibility", "clock", "day_lock")
+# Every NO_TRADE/WAIT branch of final_decision_router(), in the order it evaluates them, followed by the
+# engine-level overrides that run after the router and can also turn a GO into a NO-GO.
+VETO_ORDER = ("trigger_consumed", "trigger_ownership", "data_stale", "account_safety", "spread", "setup",
+              "confluence", "zone", "trigger", "slow", "scouts", "rr", "target", "higher_tf_conflict",
+              "session_target", "session_feasibility", "cold_start", "send_time", "clock", "day_lock")
 
 
 def router_vetoes(value: DecisionInput, gate: dict | None = None) -> list[dict]:
@@ -65,9 +68,26 @@ def router_vetoes(value: DecisionInput, gate: dict | None = None) -> list[dict]:
     remaining = gate.get("remaining_minutes")
     minimum_remaining = gate.get("minimum_remaining_minutes")
     checks = [
+        ("trigger_consumed", bool(value.trigger.consumed),
+         "the current trigger was already consumed by an order",
+         "a new zone visit produces a fresh trigger"),
+        ("trigger_ownership",
+         bool(value.setup_id is not None and (value.trigger.setup_id != value.setup_id or value.trigger.direction != value.pa_side)),
+         f"trigger belongs to setup {value.trigger.setup_id} / {getattr(value.trigger.direction, 'value', value.trigger.direction)}, "
+         f"not {value.setup_id} / {getattr(value.pa_side, 'value', value.pa_side)}",
+         "a trigger prints for the selected setup in the selected direction"),
+        ("data_stale", value.freshness == Freshness.STALE,
+         f"M1 data is {value.freshness.value}",
+         "a fresh M1 bar arrives (check the feed and the broker clock)"),
+        ("account_safety", not value.account_safe,
+         str(gate.get("account_reason", "account or execution safety check failed")),
+         "the account safety gate passes: margin, total volume, trade permission, demo mode"),
         ("spread", value.spread_state == SpreadState.ABNORMAL,
          f"spread {gate.get('spread', 'n/a')} vs limit {gate.get('max_spread', 'n/a')}",
          "spread falls back to or below the configured maximum"),
+        ("setup", not (value.setup_valid and value.pa_side is not None),
+         f"setup_valid={value.setup_valid} pa_side={getattr(value.pa_side, 'value', value.pa_side)}",
+         "structure, zones and patterns agree on a directional setup"),
         ("confluence", value.confluence < value.min_confluence,
          f"confluence {value.confluence}/100 < {value.min_confluence}",
          f"confluence reaches {value.min_confluence} (more structure / sweep / zone agreement)"),
@@ -89,10 +109,22 @@ def router_vetoes(value: DecisionInput, gate: dict | None = None) -> list[dict]:
         ("target", value.target_realism in {None, TargetRealism.UNLIKELY},
          f"target realism {getattr(value.target_realism, 'value', 'n/a')}",
          "the nearest structural target becomes reachable within the remaining session range"),
+        ("higher_tf_conflict", bool(gate.get("higher_tf_conflict")),
+         str(gate.get("higher_tf_conflict_detail", "higher-timeframe conflict with a STRETCHED session target")),
+         "the higher timeframes align, or the session target stops being STRETCHED"),
+        ("session_target", bool(gate.get("session_target_unlikely")),
+         str(gate.get("session_target_detail", "the $ session move is UNLIKELY")),
+         "the remaining session range makes the configured move reachable again"),
         ("session_feasibility",
          bool(minimum_remaining is not None and remaining is not None and remaining < minimum_remaining),
          f"{remaining if remaining is None else round(float(remaining))} min left vs {minimum_remaining} min minimum",
          "the next session opens (this one no longer has enough time)"),
+        ("cold_start", bool(gate.get("cold_start")),
+         "cold start: inputs captured before the synchronous history/pattern load",
+         "the next cycle re-evaluates on warm, cached history"),
+        ("send_time", bool(gate.get("send_time_withheld")),
+         str(gate.get("send_time_detail", "order withheld at send time")),
+         "the send-time re-check of the order gate and the daily risk limits passes"),
         ("clock", not gate.get("clock_ok", True),
          str(gate.get("clock_detail", "broker clock skew")),
          "system UTC and the broker clock agree once the detected broker offset is removed"),

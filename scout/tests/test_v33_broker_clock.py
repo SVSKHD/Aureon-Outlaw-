@@ -368,3 +368,140 @@ def test_firestore_summary_carries_the_offset_and_the_veto_list(config, tmp_path
     order = [v["veto"] for v in summary["analysis"]["router_vetoes"]]
     from xau_mt5_bot.decision_router import VETO_ORDER
     assert tuple(order) == VETO_ORDER                                    # evaluation order, always the same
+
+
+# --- review follow-ups: the veto list must match the decision the router actually reached ------------------------------
+def test_veto_list_covers_every_router_no_trade_branch():
+    """`!why` must never say "nothing blocks" while the router returns NO_TRADE."""
+    import inspect
+    from xau_mt5_bot import decision_router as dr
+
+    source = inspect.getsource(dr.final_decision_router)
+    returns = source.count("return Decision(")
+    # every branch except the final authorising `return Decision(Action(value.pa_side.value), ...)`
+    assert returns - 1 == 14
+    covered = set(dr.VETO_ORDER)
+    for name in ("trigger_consumed", "trigger_ownership", "data_stale", "account_safety", "spread", "setup",
+                 "confluence", "zone", "trigger", "slow", "scouts", "rr", "target"):
+        assert name in covered, name
+    # and the engine-level overrides that run after the router
+    for name in ("higher_tf_conflict", "session_target", "session_feasibility", "cold_start", "send_time",
+                 "clock", "day_lock"):
+        assert name in covered, name
+
+    from xau_mt5_bot.cards import VETO_LABELS
+    assert set(VETO_LABELS) == covered, "every veto needs a card label"
+
+
+def test_engine_overrides_appear_in_blocked_by(config, tmp_path: Path):
+    """A cold-start NO_TRADE is a real veto and has to show up, not read as "nothing blocks"."""
+    config.project_dir = str(tmp_path)
+    client = _BrokerBarClient(broker_offset_hours=3.0)
+    client.tick = Tick(ASIA_NOW, 2500.00, 2500.20)
+    engine = TradingEngine(client, config, _CycleLogger())
+    snapshot = engine.run_cycle(ASIA_NOW)                       # first cycle is always the cold start
+    engine.shutdown()
+
+    order = [v["veto"] for v in snapshot.analysis["router_vetoes"]]
+    from xau_mt5_bot.decision_router import VETO_ORDER
+    assert tuple(order) == VETO_ORDER
+    active = {v["veto"] for v in snapshot.analysis["blocked_by"]}
+    assert active, "a NO-GO cycle must name at least one veto"
+    if snapshot.go_status == "NO-GO":
+        from xau_mt5_bot.cards import blocked_by_text
+        assert blocked_by_text(snapshot.analysis and {"analysis": snapshot.analysis}) != "nothing — every router veto is clear"
+
+
+def test_blocked_by_names_the_post_router_overrides():
+    from xau_mt5_bot.cards import blocked_by_text, why_text
+    from xau_mt5_bot.decision_router import blocked_by
+    from xau_mt5_bot.models import (DecisionInput, EntryState, Freshness, ScoutSnapshot, SessionName, Side,
+                                    SpreadState, TargetRealism, TriggerResult)
+
+    scout = ScoutSnapshot(SessionName.ASIA)
+    scout.market_speed = "NORMAL"
+    trigger = TriggerResult(True, "M1_ENGULFING"); trigger.fresh = True
+    good = DecisionInput(Side.LONG, True, EntryState.INSIDE, trigger, scout, Freshness.LIVE, SpreadState.NORMAL,
+                         True, 2.0, 1.0, TargetRealism.REALISTIC, 80, 55, None, 8, False)
+    assert blocked_by(good, {"clock_ok": True}) == []            # nothing active: the router would authorise
+
+    for key, veto in (("cold_start", "cold_start"), ("send_time_withheld", "send_time"),
+                      ("session_target_unlikely", "session_target"), ("higher_tf_conflict", "higher_tf_conflict")):
+        items = blocked_by(good, {"clock_ok": True, key: True})
+        assert [i["veto"] for i in items] == [veto], key
+        snap = {"analysis": {"blocked_by": items}}
+        assert blocked_by_text(snap) != "nothing — every router veto is clear"
+        assert "flips when:" in why_text(snap)
+
+
+def test_router_early_vetoes_are_reported(config):
+    from xau_mt5_bot.decision_router import blocked_by, final_decision_router
+    from xau_mt5_bot.models import (Action, DecisionInput, EntryState, Freshness, ScoutSnapshot, SessionName,
+                                    Side, SpreadState, TargetRealism, TriggerResult)
+
+    scout = ScoutSnapshot(SessionName.ASIA); scout.market_speed = "NORMAL"
+    trigger = TriggerResult(True, "M1_ENGULFING"); trigger.fresh = True
+    base = dict(pa_side=Side.LONG, setup_valid=True, entry_state=EntryState.INSIDE, trigger=trigger, scout=scout,
+                freshness=Freshness.LIVE, spread_state=SpreadState.NORMAL, account_safe=True, rr=2.0, min_rr=1.0,
+                target_realism=TargetRealism.REALISTIC, confluence=80, min_confluence=55, setup_id=None,
+                scout_contradiction_threshold=8, hold_when_slow=False)
+
+    stale = DecisionInput(**{**base, "freshness": Freshness.STALE})
+    assert final_decision_router(stale).action == Action.NO_TRADE
+    assert [i["veto"] for i in blocked_by(stale, {"clock_ok": True})] == ["data_stale"]
+
+    unsafe = DecisionInput(**{**base, "account_safe": False})
+    assert final_decision_router(unsafe).action == Action.NO_TRADE
+    items = blocked_by(unsafe, {"clock_ok": True, "account_reason": "No free margin"})
+    assert [i["veto"] for i in items] == ["account_safety"] and "No free margin" in items[0]["detail"]
+
+    no_setup = DecisionInput(**{**base, "setup_valid": False})
+    assert final_decision_router(no_setup).action == Action.NO_TRADE
+    assert [i["veto"] for i in blocked_by(no_setup, {"clock_ok": True})] == ["setup"]
+
+    consumed = TriggerResult(True, "M1_ENGULFING"); consumed.fresh = True; consumed.consumed = True
+    used = DecisionInput(**{**base, "trigger": consumed})
+    assert final_decision_router(used).action == Action.NO_TRADE
+    assert [i["veto"] for i in blocked_by(used, {"clock_ok": True})] == ["trigger_consumed"]
+
+
+def test_repeat_close_does_not_re_emit_a_stale_pair_card(config):
+    """A second close_session() with nothing open must not replay the last pair's tickets and P/L."""
+    from types import SimpleNamespace
+    events: list[tuple[str, dict]] = []
+    client = FakeClient()
+    manager = ScoutManager(client, config, lambda k, p: events.append((k, p)))
+    magic = config.magic.scout_asia
+    for side, kind in (("BUY", 0), ("SELL", 1)):
+        client._positions.append(SimpleNamespace(ticket=900 + kind, symbol=config.symbol, magic=magic, volume=0.01,
+                                                 type=kind, price_open=2500.0, profit=1.0, comment=side, sl=0.0, tp=0.0))
+    manager.current_session = SessionName.ASIA
+    manager.session_open_price = 2500.0
+    manager.session_open_time = ASIA_NOW
+
+    first = manager.close_session(SessionName.ASIA)
+    assert first.success
+    closes = [p for k, p in events if k == "scout_session_close"]
+    assert len(closes) == 1 and closes[0]["buy_ticket"] == 900 and closes[0]["sell_ticket"] == 901
+
+    events.clear()
+    second = manager.close_session(SessionName.ASIA)
+    assert second.success and "No open" in second.message
+    assert [k for k, _ in events if k == "scout_session_close"] == []       # no duplicate, no stale tickets
+
+
+def test_detection_signature_moves_when_a_zone_changes():
+    from xau_mt5_bot.cards import detection_signature
+    base = {"patterns": [], "structures": {}, "sweeps": [],
+            "zones": [{"kind": "DEMAND_OB", "side": "LONG", "low": 2400.0, "high": 2404.0, "score": 8.0, "status": "FRESH"}]}
+    same = detection_signature(base)
+    assert detection_signature(dict(base)) == same                          # stable when nothing changed
+
+    moved = {**base, "zones": [{**base["zones"][0], "low": 2401.0, "high": 2405.0}]}
+    assert detection_signature(moved) != same                               # a new/changed zone pushes the card
+
+    mitigated = {**base, "zones": [{**base["zones"][0], "status": "MITIGATED"}]}
+    assert detection_signature(mitigated) != same
+
+    rescored = {**base, "zones": [{**base["zones"][0], "score": 8.4}]}
+    assert detection_signature(rescored) == same                            # score drift alone is not a detection

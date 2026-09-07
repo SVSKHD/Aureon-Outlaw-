@@ -189,13 +189,22 @@ def detection_signature(s: dict[str, Any]) -> str:
     evs = tuple((tf, e.get("event"), str(e.get("timestamp"))) for tf in ("H4", "H1", "M15", "M5")
                 for e in (_g(s, "structures", tf, "events", default=[]) or [])[-2:])
     sweeps = tuple((sw.get("level_type"), str(sw.get("sweep_time"))) for sw in (s.get("sweeps") or []) if sw.get("active", True))
-    return str(hash((pats, evs, sweeps)))
+    # v3.3.0: the card shows zones, so a new or changed zone has to move the signature too — otherwise the
+    # detections push never fires for one. Coarse identity (kind, bounds, status) keeps score drift out of it.
+    zones = tuple((z.get("kind"), z.get("side"), round(float(z.get("low") or 0), 2),
+                   round(float(z.get("high") or 0), 2), z.get("status")) for z in (s.get("zones") or [])[:5])
+    return str(hash((pats, evs, sweeps, zones)))
 
 
 VETO_LABELS = {
-    "spread": "Spread", "confluence": "Confluence < min", "zone": "Not inside zone", "trigger": "No fresh trigger",
-    "slow": "Market SLOW", "scouts": "Scouts contradict", "rr": "Risk-reward", "target": "$10 target",
-    "session_feasibility": "Session feasibility", "clock": "Broker clock", "day_lock": "Day lock",
+    "trigger_consumed": "Trigger consumed", "trigger_ownership": "Trigger belongs elsewhere",
+    "data_stale": "M1 data stale", "account_safety": "Account not safe",
+    "spread": "Spread", "setup": "No valid setup", "confluence": "Confluence < min",
+    "zone": "Not inside zone", "trigger": "No fresh trigger", "slow": "Market SLOW",
+    "scouts": "Scouts contradict", "rr": "Risk-reward", "target": "$10 target",
+    "higher_tf_conflict": "Higher-timeframe conflict", "session_target": "Session target UNLIKELY",
+    "session_feasibility": "Session feasibility", "cold_start": "Cold start cycle",
+    "send_time": "Withheld at send", "clock": "Broker clock", "day_lock": "Day lock",
 }
 
 
