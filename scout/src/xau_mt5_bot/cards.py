@@ -73,6 +73,7 @@ def status_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
     if plan:
         tps = " / ".join(f"{_f(tp)} ({_f(rr)}R)" for tp, rr in zip(plan.get("take_profits") or [], plan.get("actual_rr") or []))
         plan_text = f"{plan.get('side')} entry {_f(plan.get('entry'))} · SL {_f(plan.get('stop_loss'))}\nTP {tps or 'none'} · {plan.get('target_realism')}"
+    zone_text = f"{_f(zone.get('low'))}–{_f(zone.get('high'))} {zone.get('kind')}" if zone else "no zone"
     return {
         "title": f"{'🟢' if colour == GREEN else '🟠' if colour == AMBER else '⚪' if colour == GREY else '🔴'} {go} · {action} · {pa} {conf}/100",
         "description": f"{s.get('session')} · {_t(s.get('timestamp'), tz)} · {_f(s.get('bid'))}/{_f(s.get('ask'))} spread {_f(s.get('spread'))} · data {s.get('freshness')}",
@@ -81,7 +82,7 @@ def status_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
             ("Structure", f"D1 {_g(st, 'D1', 'state')} · H4 {_g(st, 'H4', 'state')} · H1 {_g(st, 'H1', 'state')} · M15 {_g(st, 'M15', 'state')} · M5 {_g(st, 'M5', 'state')}", False),
             ("Scouts", f"{sc.get('leader') or 'none'} · BUY {_f(sc.get('buy_pnl'))} / SELL {_f(sc.get('sell_pnl'))} · {sc.get('verdict')} {sc.get('strength')}/10 · pace {sc.get('market_speed')}", True),
             ("Silver", f"{im.get('regime', 'n/a')} r={im.get('correlation')} · SMT {im.get('smt', 'NONE')} · leading {im.get('silver_leading', 'NONE')}", True),
-            ("Entry", f"{f'{_f(zone.get('low'))}–{_f(zone.get('high'))} {zone.get('kind')}' if zone else 'no zone'} · {s.get('entry_state')} · trigger {'CONFIRMED' if _g(s, 'trigger', 'confirmed') else 'waiting'}", False),
+            ("Entry", f"{zone_text} · {s.get('entry_state')} · trigger {'CONFIRMED' if _g(s, 'trigger', 'confirmed') else 'waiting'}", False),
             ("Plan", plan_text, False),
             ("$10 target", f"{tgt.get('target_verdict', 'n/a')} · {_f(_g(s, 'analysis', 'remaining_session_minutes'), 0)} min left", True),
             ("Why", str(_g(s, "decision", "reason", default="")), False),

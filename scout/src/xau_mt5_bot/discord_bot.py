@@ -156,13 +156,14 @@ def fmt_status(state: BotState) -> str:
     tgt = _get(s, "analysis", "session_target", default={})
     mtf = _get(s, "analysis", "multi_timeframe", default={})
     zone = (s.get("zones") or [None])[0]
+    zone_text = f"{_f(zone.get('low'))}–{_f(zone.get('high'))} ({zone.get('kind')})" if zone else "none"
     lines = [
         f"**[{s.get('go_status')}] [{_get(s, 'decision', 'action')}]** {ts}{stale} · {s.get('session')} · {_f(s.get('bid'))}/{_f(s.get('ask'))} spread {_f(s.get('spread'))} · data {s.get('freshness')}",
         f"PA {s.get('pa_side') or 'NEUTRAL'} · confluence {s.get('confluence')}/100 · D1 {_get(st, 'D1', 'state')} H4 {_get(st, 'H4', 'state')} H1 {_get(st, 'H1', 'state')} M15 {_get(st, 'M15', 'state')} M5 {_get(st, 'M5', 'state')}",
         f"MTF {mtf.get('label', 'n/a')} · target {tgt.get('target_verdict', 'n/a')} · {_f(_get(s, 'analysis', 'remaining_session_minutes'), 0)} min left · calibration {_get(s, 'reporting', 'calibration_status', default='n/a')}",
         f"Scouts: leader {sc.get('leader')} · BUY {_f(sc.get('buy_pnl'))} · SELL {_f(sc.get('sell_pnl'))} · {sc.get('verdict')} {sc.get('strength')}/10 · pace {sc.get('market_speed')}",
         f"Silver: {im.get('regime', 'n/a')} r={im.get('correlation')} · SMT {im.get('smt', 'NONE')} · leading {im.get('silver_leading', 'NONE')} · +{im.get('long_points', 0)}L/+{im.get('short_points', 0)}S",
-        f"Entry: {f'{_f(zone.get('low'))}–{_f(zone.get('high'))} ({zone.get('kind')})' if zone else 'none'} · {s.get('entry_state')} · trigger {'CONFIRMED' if _get(s, 'trigger', 'confirmed') else 'waiting'} — {_get(s, 'trigger', 'reason')}",
+        f"Entry: {zone_text} · {s.get('entry_state')} · trigger {'CONFIRMED' if _get(s, 'trigger', 'confirmed') else 'waiting'} — {_get(s, 'trigger', 'reason')}",
         f"Reason: {_get(s, 'decision', 'reason')}",
     ]
     return "\n".join(lines)
