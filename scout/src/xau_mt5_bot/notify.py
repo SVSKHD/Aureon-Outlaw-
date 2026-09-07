@@ -15,13 +15,14 @@ from .cards import detection_signature, detections_card, event_card, snapshot_di
 class Discord:
     TRADE_EVENTS: frozenset = frozenset({"startup", "startup_failed", "shutdown", "restart", "cycle_error", "integration_disabled",
                    "session_transition", "session_summary", "weekly_report", "next_week_open_report",
-                   "scout_session_open", "scout_session_close", "scout_rollback", "scout_stale_pair_closed",
-                   "order", "order_withheld", "pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close", "trade_closed",
+                   "scout_session_open", "scout_session_close", "scout_rollback", "scout_stale_pair_closed", "scout_adopted",
+                   "broker_clock_offset", "order", "order_withheld", "pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close", "trade_closed",
                    "strong_scout_contradiction", "smt_divergence", "state_file_recovered", "scout_open_failed"})               # v3.1.1: quiet default
 
     def __init__(self, webhook_env: str, min_interval: int = 300, scout_pair_min_interval: int = 60,
                  retry_count: int = 3, retry_backoff_seconds: float = 1.0,
-                 status_mode: str = "events", event_level: str = "trade") -> None:
+                 status_mode: str = "events", event_level: str = "trade", display_timezone: str = "UTC") -> None:
+        self.display_timezone = display_timezone                                              # v3.3.0: event cards render local times
         self.status_mode, self.event_level = status_mode, event_level                         # v3.1.1
         self.url = os.environ.get(webhook_env, "") or os.environ.get("DISCORD_WEBHOOK_URL", "")     # v3.1.0: accept the common alias
         self.min_interval = min_interval
@@ -134,10 +135,10 @@ class Discord:
             if now - self._last_pair_event.get(key, 0) < self.scout_pair_min_interval:
                 return False
             self._last_pair_event[key] = now
-            return self.send(embed=event_card(kind, payload))
+            return self.send(embed=event_card(kind, payload, self.display_timezone))
         elif kind in {"session_transition", "order", "order_withheld", "pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close",
                       "trade_closed", "smt_divergence", "cycle_error", "startup_failed", "session_summary"}:
-            return self.send(embed=event_card(kind, payload))                                        # v3.2.0 cards
+            return self.send(embed=event_card(kind, payload, self.display_timezone))                     # v3.2.0 cards
         elif kind == "session_summary_legacy":
             sc = payload.get("scout", {})
             return self.send(f"**SESSION SUMMARY — {payload.get('session')} — {payload.get('go', 'NO-GO')} — {payload.get('report_status', 'COMPLETE')}**\nPA trades {payload.get('pa_trades', 0)} · W/L {payload.get('wins', 0)}/{payload.get('losses', 0)} · net {payload.get('net_pnl', 0):+.2f}\n"
@@ -170,4 +171,4 @@ class Discord:
         elif kind == "mt5_validated":
             return self.send(f"**MT5 ATTACHED** · account {payload.get('login')}@{payload.get('server')} · demo={payload.get('is_demo')} hedging={payload.get('is_hedging')} · algo={payload.get('algo_trading')} · tick age {payload.get('tick_age_seconds')}s")
         else:
-            return self.send(embed=event_card(kind, payload))
+            return self.send(embed=event_card(kind, payload, self.display_timezone))

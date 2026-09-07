@@ -91,7 +91,9 @@ def test_discord_commands_answer_from_bot_files(tmp_path):
     engine.shutdown()
     state = BotState(tmp_path)
     status = dispatch(state, "!status")
-    assert isinstance(status, dict) and status["title"].split(" · ")[1] in {"LONG", "SHORT", "WAIT", "NO TRADE"} and "COUPLED" in status["fields"][2]["value"]
+    assert isinstance(status, dict) and status["title"].split(" · ")[1] in {"LONG", "SHORT", "WAIT", "NO TRADE"}
+    fields = {f["name"]: f["value"] for f in status["fields"]}                       # v3.3.0: look fields up by name
+    assert "COUPLED" in fields["Silver"]
     text = dispatch(state, "!text")
     assert text.startswith("**[") and "Silver: COUPLED" in text
     det = dispatch(state, "!detected")

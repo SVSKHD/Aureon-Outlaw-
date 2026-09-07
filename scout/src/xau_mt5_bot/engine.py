@@ -345,6 +345,35 @@ class TradingEngine:
             "session_minutes_remaining": round(remaining_minutes, 1), "remaining_bucket": remaining_bucket(remaining_minutes),
         }
 
+    def _order_payload(self, result, plan, snapshot, zone, trigger, setup_id, intermarket) -> dict[str, Any]:
+        """Everything a reader needs to judge a fill without opening MT5 (v3.3.0)."""
+        risk_price = abs(float(plan.entry) - float(plan.stop_loss))
+        risk_currency = None
+        try:
+            value = self.client.calc_profit(self.config.symbol, plan.side.value, float(plan.volume),
+                                            float(plan.entry), float(plan.stop_loss))
+            risk_currency = round(abs(float(value)), 2) if value is not None else None
+        except Exception:
+            risk_currency = None
+        im = intermarket or {}
+        silver = (f"{im.get('regime', 'n/a')} r={im.get('correlation')} · SMT {im.get('smt', 'NONE')}"
+                  if im.get("status") == "OK" else f"unavailable ({im.get('reason', 'disabled')})")
+        return {
+            "ticket": result.ticket, "side": plan.side.value, "session": snapshot.session.value,
+            "entry": round(float(plan.entry), 2), "requested_entry": round(float(plan.requested_entry or plan.entry), 2),
+            "stop_loss": round(float(plan.stop_loss), 2), "sl_reason": plan.sl_reason,
+            "take_profits": [round(float(tp), 2) for tp in plan.take_profits],
+            "actual_rr": [round(float(r), 2) for r in (plan.actual_rr or [])],
+            "volume": float(plan.volume), "risk_price": round(risk_price, 2), "risk_currency": risk_currency,
+            "zone_kind": getattr(zone, "kind", None),
+            "zone": f"{zone.low:.2f}–{zone.high:.2f}" if zone is not None else None,
+            "trigger_reason": trigger.reason, "trigger_source": trigger.source,
+            "confluence": int(snapshot.confluence), "scout_verdict": snapshot.scout.verdict.value,
+            "scout_leader": snapshot.scout.leader, "scout_strength": int(snapshot.scout.strength),
+            "silver": silver, "setup_id": setup_id, "target_realism": plan.target_realism.value if plan.target_realism else None,
+            "invalidation": plan.invalidation, "retcode": result.retcode, "message": result.message,
+        }
+
     def _finalize_realized(self, now: datetime) -> None:
         """Recognise trades that closed at the broker since the last check (SL/TP/manual) before any order decision."""
         if getattr(self, "_finalizing", False):
@@ -813,6 +842,7 @@ class TradingEngine:
                                     "buy_pnl": scout.buy_pnl, "sell_pnl": scout.sell_pnl, "market_speed": scout.market_speed,
                                     "role": "SECONDARY_CONFIRMATION_ONLY"},
             "fakeout_risk": rel.get("fakeout_rate"), "remaining_session_minutes": round(remaining_minutes, 1),
+            "atr": round(atr, 3),                                                                                  # v3.3.0: zone distance in ATR on the cards
             "intermarket": intermarket,                                                                            # v3.1.0
             "broker_clock": self.broker_clock(),                                                                   # v3.3.0
         }
@@ -833,6 +863,7 @@ class TradingEngine:
             result = execute_pa_trade(self.client, self.config, decision, plan, self.logger.event)            # 9-13. sizing, order_check, retry, verify
             self.logger.order("PA", result, {"decision": decision, "plan": plan, "result": result, "setup_id": setup_id})
             if result.success:
+                self.logger.event("order", self._order_payload(result, plan, snapshot, selected, trigger, setup_id, intermarket))   # v3.3.0: the card the trade log was missing
                 from dataclasses import asdict
                 for p in self.client.positions(self.config.symbol, self.config.magic.pa):
                     if str(int(p.ticket)) not in self.positions.tracked:
@@ -1056,7 +1087,11 @@ class TradingEngine:
         return max(starts) if starts else None
 
     def _report_scout_failure(self, session, result, attempt: int = 1) -> None:
-        """v3.2.0: one explicit, card-worthy event per failed scout placement (retcode parsed from the message)."""
+        """One explicit, card-worthy event per failed scout placement.
+
+        v3.3.0: carries everything the SCOUTS NOT PLACED card needs to be actionable — the detected
+        broker offset, the live spread against its limit, free margin, and when the retry happens.
+        """
         import re
         match = re.search(r"\b(10\d{3})\b", result.message or "")
         retcode = int(match.group(1)) if match else None
@@ -1064,8 +1099,28 @@ class TradingEngine:
         if self._last_scout_failure_key == key and attempt > 1:
             return                                                                    # same failure repeating on retries — one card
         self._last_scout_failure_key = key
-        self.logger.event("scout_open_failed", {"session": session.value, "message": result.message, "retcode": retcode,
-                                                "retryable": result.retryable, "attempt": attempt})
+        now = getattr(self, "cycle_now", None) or datetime.now(UTC)
+        payload: dict[str, Any] = {"session": session.value, "message": result.message, "retcode": retcode,
+                                   "retryable": result.retryable, "attempt": attempt,
+                                   "next_retry": (now + timedelta(seconds=min(300, 5 * (2 ** min(attempt - 1, 6))))).isoformat()
+                                   if result.retryable else None,
+                                   "display_timezone": self.config.display_timezone,
+                                   **self.broker_clock()}
+        try:
+            tick = self.client.get_tick(self.config.symbol)
+            payload.update({"spread": round(tick.spread, 3), "max_spread_price": self.config.risk.max_spread_price})
+        except Exception:
+            pass
+        try:
+            account = self.client.account_state()
+            lot = self.config.risk.scout_lot
+            payload.update({"margin_free": round(account.margin_free, 2), "balance": round(account.balance, 2),
+                            "equity": round(account.equity, 2), "is_hedging": account.is_hedging, "is_demo": account.is_demo,
+                            "pair_volume": round(2 * lot, 2)})
+        except Exception:
+            pass
+        payload["day_lock"] = self.positions.day.get("locked")
+        self.logger.event("scout_open_failed", payload)
 
     def _intermarket(self, closed: dict[str, pd.DataFrame], now: datetime) -> dict[str, Any]:
         """v3.1.0: load silver from the same terminal and assess correlation/SMT. Any failure → UNAVAILABLE, never blocks the cycle."""

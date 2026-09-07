@@ -41,6 +41,7 @@ class ScoutManager:
         self.fingerprint: str = ""                        # set by the engine before restore()
         self.account_key: str = ""
         self._pending_stats: dict | None = None            # session summary awaiting confirmed closure (v2.0.0 item 4)
+        self.open_failures: dict[str, int] = {}            # v3.3.0: consecutive failed placements per session, for the cards
 
     def _send(self, side: str, lot: float, magic: int, comment: str) -> OrderResult:
         """Every scout order goes through normalisation, order_check, retry and fill verification (item 5)."""
@@ -126,6 +127,11 @@ class ScoutManager:
         self.session_open_price = float(data["open_price"]) if data.get("open_price") is not None else None
         self.session_open_time = datetime.fromisoformat(data["open_time"]) if data.get("open_time") else None
 
+    def _failed(self, session: SessionName, message: str, retryable: bool = True) -> ScoutTransitionResult:
+        """Every failed placement is counted so the eventual success can say 'after N failed attempts'."""
+        self.open_failures[session.value] = self.open_failures.get(session.value, 0) + 1
+        return ScoutTransitionResult(False, message, retryable=retryable)
+
     def magic(self, session: SessionName) -> int:
         return {
             SessionName.ASIA: self.config.magic.scout_asia,
@@ -151,6 +157,11 @@ class ScoutManager:
                 self.session_open_time = broker_epoch_to_utc(self.client, int(t)) if isinstance(t, (int, float)) else now.astimezone(UTC)   # v3.3.0
                 adopted = True
                 self.audit("scout_adopted", {"session": session.value, "tickets": [int(p.ticket) for p in positions], "legs": len(positions),
+                                             "buy_ticket": next((int(p.ticket) for p in positions if int(getattr(p, "type", 1)) == 0), None),
+                                             "sell_ticket": next((int(p.ticket) for p in positions if int(getattr(p, "type", 1)) == 1), None),
+                                             "open_price": round(self.session_open_price, 2),
+                                             "open_time": self.session_open_time.isoformat() if self.session_open_time else None,
+                                             "lot": round(sum(float(p.volume) for p in positions) / len(positions), 2),
                                              "mfe_mae_restored": [int(p.ticket) in self.extrema for p in positions]})
             else:
                 for p in positions:
@@ -214,38 +225,54 @@ class ScoutManager:
             return ScoutTransitionResult(False, "Live account not authorized", retryable=False)
         ok, why = self.orders_ok()
         if not ok:
-            return ScoutTransitionResult(False, f"Scout orders blocked: {why}")
+            return self._failed(session, f"Scout orders blocked: {why}")
         lot = normalize_volume(self.config.risk.scout_lot, self.client.symbol_info(self.config.symbol))
         safe, safe_why = account_is_safe(self.client, self.config, True, 2 * lot)                   # item 6: both legs
         if not safe:
-            return ScoutTransitionResult(False, f"Scout pair blocked: {safe_why}")
+            return self._failed(session, f"Scout pair blocked: {safe_why}")
         buy = self._send("BUY", lot, magic, f"SCOUT_{session.value}_BUY")
         if not buy.success:
-            return ScoutTransitionResult(False, f"BUY scout failed: {buy.retcode} {buy.message}")
+            return self._failed(session, f"BUY scout failed: {buy.retcode} {buy.message}")
         sell = self._send("SELL", lot, magic, f"SCOUT_{session.value}_SELL")
         if not sell.success:
+            rolled = []
             for p in self.client.positions(self.config.symbol, magic):
-                self._close(int(p.ticket), magic, "rollback: SELL leg failed")
-            self.audit("scout_rollback", {"session": session.value, "reason": sell.message, "pending": len(self.pending_closures)})
-            return ScoutTransitionResult(False, f"SELL scout failed; BUY rolled back: {sell.retcode} {sell.message}")
+                if self._close(int(p.ticket), magic, "rollback: SELL leg failed"):
+                    rolled.append(int(p.ticket))
+            self.audit("scout_rollback", {"session": session.value, "failed_leg": "SELL", "retcode": sell.retcode,   # v3.3.0: full story
+                                          "reason": sell.message, "message": sell.message, "closed_tickets": rolled,
+                                          "closed_leg": "BUY", "lot": lot, "pending": len(self.pending_closures)})
+            return self._failed(session, f"SELL scout failed; BUY rolled back: {sell.retcode} {sell.message}")
         positions = self.client.positions(self.config.symbol, magic)
         if len(positions) != 2:
             for position in positions:
                 self._close(int(position.ticket), magic, "rollback: pair verification failed")
-            return ScoutTransitionResult(False, "Scout pair verification failed and was rolled back")
+            self.audit("scout_rollback", {"session": session.value, "failed_leg": "PAIR", "reason": "pair verification failed",
+                                          "closed_tickets": [int(p.ticket) for p in positions], "lot": lot})
+            return self._failed(session, "Scout pair verification failed and was rolled back")
         buy_positions = [p for p in positions if int(getattr(p, "type", 1)) == 0]
         sell_positions = [p for p in positions if int(getattr(p, "type", 1)) == 1]
         equal = len(buy_positions) == len(sell_positions) == 1 and abs(float(buy_positions[0].volume) - float(sell_positions[0].volume)) < 1e-9
         if not equal:
             for position in positions:
                 self._close(int(position.ticket), magic, "rollback: unequal scout volume")
-            return ScoutTransitionResult(False, "Scout legs were not equal volume; pair rolled back")
+            self.audit("scout_rollback", {"session": session.value, "failed_leg": "PAIR", "reason": "unequal scout volume",
+                                          "closed_tickets": [int(p.ticket) for p in positions], "lot": lot})
+            return self._failed(session, "Scout legs were not equal volume; pair rolled back")
         tick = self.client.get_tick(self.config.symbol)
         self.current_session = session
         self.session_open_price = (tick.bid + tick.ask) / 2
         self.session_open_time = timestamp.astimezone(UTC)
         self.price_samples = []
-        self.audit("scout_session_open", {"session": session.value, "magic": magic, "lot": lot, "open_price": round(self.session_open_price, 2)})
+        buy_leg, sell_leg = buy_positions[0], sell_positions[0]
+        failed_attempts = self.open_failures.pop(session.value, 0)                                  # v3.3.0: "after N failed attempts"
+        self.audit("scout_session_open", {
+            "session": session.value, "magic": magic, "lot": lot, "open_price": round(self.session_open_price, 2),
+            "buy_ticket": int(buy_leg.ticket), "sell_ticket": int(sell_leg.ticket),
+            "buy_entry": round(float(buy_leg.price_open), 2), "sell_entry": round(float(sell_leg.price_open), 2),
+            "emergency_sl_price": self.config.risk.emergency_scout_sl_price,
+            "buy_sl": round(float(getattr(buy_leg, "sl", 0) or 0), 2), "sell_sl": round(float(getattr(sell_leg, "sl", 0) or 0), 2),
+            "open_time": self.session_open_time.isoformat(), "failed_attempts": failed_attempts})
         return ScoutTransitionResult(True, f"Opened paired {session.value} scouts")
 
     def close_session(self, session: SessionName) -> ScoutTransitionResult:
@@ -288,6 +315,8 @@ class ScoutManager:
             if self._pending_stats is None or self._pending_stats.get("session") != session.value or len(positions) == 2:
                 self._pending_stats = summary                               # v2.1.0 item 9: a one-leg retry never overwrites the pair summary
                 self._persist()
+        buy_ticket = next((int(p.ticket) for p in positions if int(getattr(p, "type", 1)) == 0), None)
+        sell_ticket = next((int(p.ticket) for p in positions if int(getattr(p, "type", 1)) == 1), None)
         results = [self._close(int(position.ticket), magic, f"session {session.value} close") for position in positions]
         all_ok = all(results)
         if not all_ok or self.client.positions(self.config.symbol, magic):
@@ -297,7 +326,17 @@ class ScoutManager:
             self.audit_once("scout_session_stats", stats.get("stats_key") or f"{self.account_key}:{self.config.symbol}:{self.fingerprint}:{stats['session_id']}", stats)   # §5.2 scoped key; raises → pending kept
             self._pending_stats = None; self.calibration_sessions += 1
             self._persist()
-        self.audit("scout_session_close", {"session": session.value, "magic": magic})
+        closed_summary = self.last_closed_summary or {}
+        self.audit("scout_session_close", {                                                          # v3.3.0: the whole pair story
+            "session": session.value, "magic": magic, "closed_tickets": [int(p.ticket) for p in positions],
+            "buy_ticket": buy_ticket, "sell_ticket": sell_ticket,
+            "buy_pnl": closed_summary.get("buy_pnl"), "sell_pnl": closed_summary.get("sell_pnl"),
+            "pnl": round(float(closed_summary.get("buy_pnl") or 0) + float(closed_summary.get("sell_pnl") or 0), 2),
+            "leader": closed_summary.get("leader"), "verdict": closed_summary.get("verdict"), "strength": closed_summary.get("strength"),
+            "buy_mfe": closed_summary.get("buy_mfe"), "buy_mae": closed_summary.get("buy_mae"),
+            "sell_mfe": closed_summary.get("sell_mfe"), "sell_mae": closed_summary.get("sell_mae"),
+            "market_speed": closed_summary.get("market_speed"), "displacement": closed_summary.get("displacement"),
+            "open_time": closed_summary.get("open_time"), "close_time": closed_summary.get("close_time")})
         self.extrema.clear()
         self.price_samples = []
         self._persist()

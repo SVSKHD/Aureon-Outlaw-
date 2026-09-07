@@ -34,7 +34,7 @@ def cli() -> int:
     discord = Discord(integ.discord_webhook_env, integ.discord_min_interval_seconds,
                       config.reporting.discord_scout_pair_min_interval_seconds,
                       integ.discord_retry_count, integ.discord_retry_backoff_seconds,
-                      integ.discord_status_mode, integ.discord_event_level)
+                      integ.discord_status_mode, integ.discord_event_level, config.display_timezone)
     sink = FirestoreSink(integ.firebase_key_path, integ.firestore_push_seconds, integ.series_sample_seconds,
                          integ.firestore_series_max_points)
     telemetry = Telemetry(flush_seconds=integ.telemetry_flush_seconds)

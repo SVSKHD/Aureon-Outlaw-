@@ -13,7 +13,7 @@ authorisation point; there is deliberately no `!buy` / `!close`.
 Env: DISCORD_BOT_TOKEN (required), DISCORD_COMMAND_CHANNEL_ID or DISCORD_CHANNEL_ID (optional: answer only there),
      DISCORD_ALLOWED_USER_IDS (optional, comma-separated: answer only these users), DISCORD_COMMAND_PREFIX (default "!").
 
-Commands: !status !detected !text !plan !silver !scouts !positions !day !trades [n] !go !events [n] !heartbeat !reports [n] !help
+Commands: !status !why !clock !detected !text !plan !silver !scouts !positions !day !trades [n] !go !events [n] !heartbeat !reports [n] !help
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import json
 import os
 import sqlite3
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -31,6 +31,7 @@ import yaml
 from .cards import detections_card, status_card
 
 HELP = (
+    "`!why` (`!decide`) full gate table: verdict, every gate, what would flip it · `!clock` broker time offset and clock guard\n"
     "`!status` GO/NO-GO card · `!detected` patterns/structure/sweeps/zones card · `!text` old status block · `!plan` entry/SL/TP/RR · `!silver` XAU/XAG correlation + SMT · `!scouts` session pair\n"
     "`!positions` open PA trades · `!day` realised P/L and locks · `!trades [n]` last closed trades · `!go` session GO tallies\n"
     "`!events [n]` last audit events · `!reports [n]` session/weekly reports · `!heartbeat` process health · `!help`\n"
@@ -318,6 +319,64 @@ def fmt_heartbeat(state: BotState) -> str:
     ])
 
 
+def fmt_why(state: BotState) -> str:
+    """v3.3.0: the whole router gate table for the latest cycle — why it is a NO-GO, and what would change it."""
+    s = state.latest_snapshot()
+    if not s:
+        return "No snapshot yet — is the trading bot running?"
+    trace = _get(s, "analysis", "decision_trace", default={}) or {}
+    if not trace:
+        return (f"This snapshot predates v3.3.0, so there is no gate table. Router said: "
+                f"{_get(s, 'decision', 'action')} — {_get(s, 'decision', 'reason')}")
+    lines = [f"**[{s.get('go_status')}] {trace.get('verdict')}**",
+             f"{state.local(s.get('timestamp'))} · {s.get('session')} · {trace.get('passed_count')}/{trace.get('gate_count')} gates passed",
+             "```"]
+    for gate in trace.get("gates") or []:
+        mark = "PASS" if gate.get("passed") else "FAIL"
+        threshold = f" (need {gate['threshold']})" if gate.get("threshold") not in (None, "") else ""
+        lines.append(f"{mark:4} {str(gate.get('name'))[:22]:22} {str(gate.get('value'))[:28]:28}{threshold}")
+    lines.append("```")
+    if trace.get("next"):
+        lines.append("**What would flip it**\n" + "\n".join(f"• {item}" for item in trace["next"][:6]))
+    evidence = trace.get("evidence") or {}
+    for label in ("long", "short"):
+        items = evidence.get(label) or []
+        if items:
+            lines.append(f"{label.upper()} evidence ({evidence.get(label + '_score')}): "
+                         + ", ".join(f"{i['label']} +{i['points']}" for i in items))
+    lines.append(f"Silver: {evidence.get('silver', 'n/a')}")
+    lines.append(trace.get("go_meaning", ""))
+    return "\n".join(x for x in lines if x)
+
+
+def fmt_clock(state: BotState) -> str:
+    """v3.3.0: system UTC, broker time, detected offset, residual skew and the guard's verdict."""
+    s = state.latest_snapshot() or {}
+    clock = _get(s, "analysis", "broker_clock", default={}) or {}
+    hb = state.heartbeat() or {}
+    if not clock and hb.get("broker_utc_offset_hours") is not None:
+        clock = {"broker_utc_offset_hours": hb.get("broker_utc_offset_hours"),
+                 "residual_skew_seconds": hb.get("broker_clock_residual_seconds"),
+                 "broker_clock_source": hb.get("broker_clock_source"), "clock_ok": hb.get("broker_clock_ok"),
+                 "broker_server": hb.get("broker_server")}
+    if not clock:
+        return "No broker clock reading yet — start the trading bot (v3.3.0 or newer)."
+    now = datetime.now(UTC)
+    hours = float(clock.get("broker_utc_offset_hours") or 0)
+    broker_now = now + timedelta(hours=hours)
+    residual = clock.get("residual_skew_seconds", clock.get("broker_clock_residual_seconds"))
+    limit = clock.get("max_clock_skew_seconds", 600)
+    ok = clock.get("clock_ok")
+    return "\n".join([
+        f"**Broker clock** {'✅ orders allowed' if ok else '⛔ orders blocked by the clock guard'}",
+        f"System UTC: {now.strftime('%Y-%m-%d %H:%M:%S')} · local {now.astimezone(state.tz).strftime('%H:%M:%S %Z')}",
+        f"Broker time: {broker_now.strftime('%Y-%m-%d %H:%M:%S')} (server {clock.get('broker_server') or 'n/a'})",
+        f"Detected offset: UTC{hours:+g}h ({clock.get('broker_clock_source', 'auto')})",
+        f"Residual skew: {_f(residual, 1)}s · limit {limit}s",
+        "The offset is applied to every tick and bar before analysis, so only the residual can block orders.",
+    ])
+
+
 def _age_seconds(iso: str | None) -> float | None:
     try:
         return (datetime.now(UTC) - datetime.fromisoformat(iso)).total_seconds()
@@ -347,6 +406,8 @@ def dispatch(state: BotState, text: str, prefix: str = "!") -> str | dict[str, A
         if cmd in {"detected", "patterns", "seen"}:
             snap = state.latest_snapshot()
             return detections_card(snap, str(state.tz)) if snap else "No snapshot yet."
+        if cmd in {"why", "decide", "explain"}: return fmt_why(state)
+        if cmd in {"clock", "time", "offset"}: return fmt_clock(state)
         if cmd == "text": return fmt_status(state)
         if cmd == "plan": return fmt_plan(state)
         if cmd in {"silver", "xag", "smt"}: return fmt_silver(state)
