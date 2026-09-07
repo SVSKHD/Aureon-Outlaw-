@@ -75,12 +75,18 @@ class BrokerClock:
     def measure(self, epoch: float, now: datetime, server: str = "") -> "BrokerClock":
         """Detect (or, when manual, only verify) the offset from one tick.
 
-        The detected offset is the broker-minus-system difference rounded to the nearest
-        30 minutes; whatever is left over is the residual skew.
+        The FIRST measurement rounds the broker-minus-system difference to the nearest 30 minutes,
+        which is what a server timezone always is. Later measurements do NOT re-round: once the
+        timezone is known, the only legitimate change is a DST step — a whole number of hours that
+        leaves almost nothing behind. Anything else is a real clock fault and must show up as
+        residual skew instead of being quietly absorbed into a new "timezone".
         """
         delta = (self.broker_wall_clock(epoch) - now.astimezone(UTC)).total_seconds()
         if not self.manual:
-            self.offset = timedelta(seconds=round(delta / OFFSET_QUANTUM_SECONDS) * OFFSET_QUANTUM_SECONDS)
+            candidate = round(delta / OFFSET_QUANTUM_SECONDS) * OFFSET_QUANTUM_SECONDS
+            step = candidate - self.offset.total_seconds()
+            if self.measured_at is None or (step and step % 3600 == 0 and abs(delta - candidate) < 60):
+                self.offset = timedelta(seconds=candidate)
         self.residual_seconds = round(delta - self.offset.total_seconds(), 3)
         self.measured_at = now.astimezone(UTC)
         self.measurements += 1
