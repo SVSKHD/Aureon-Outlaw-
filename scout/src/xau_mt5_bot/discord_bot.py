@@ -28,11 +28,11 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from .cards import blocked_by_text, detections_card, status_card, why_text
+from .cards import blocked_by_text, decision_card, detections_card, status_card, why_text
 
 HELP = (
-    "`!status` GO/NO-GO card · `!why` what is blocking a trade and what would flip it · `!clock` broker vs system time\n"
-    "`!detected` patterns/structure/sweeps/zones card · `!text` old status block · `!plan` entry/SL/TP/RR · `!silver` XAU/XAG correlation + SMT · `!scouts` session pair\n"
+    "`!status` the decision card: verdict, gate checklist, what flips it · `!why` the same gates as text · `!clock` broker vs system time\n"
+    "`!detected` compact detections (`!detected full` for everything) · `!text` old status block · `!plan` entry/SL/TP/RR · `!silver` XAU/XAG correlation + SMT · `!scouts` session pair\n"
     "`!positions` open PA trades · `!day` realised P/L and locks · `!trades [n]` last closed trades · `!go` session GO tallies\n"
     "`!events [n]` last audit events · `!reports [n]` session/weekly reports · `!heartbeat` process health · `!help`\n"
     "Read-only. Demo bot. No order commands exist."
@@ -326,12 +326,22 @@ def fmt_heartbeat(state: BotState) -> str:
 
 
 def fmt_why(state: BotState) -> str:
-    """v3.3.0: every router veto currently blocking a trade, and what would flip each one."""
+    """v3.4.0: the gate checklist and what would flip the blocking one, from the same decision trace."""
     s = state.latest_snapshot()
     if not s:
         return "No snapshot yet."
-    header = f"**[{s.get('go_status')}] [{_get(s, 'decision', 'action')}]** {state.local(s.get('timestamp'))} · {s.get('session')}"
-    return f"{header}\n{why_text(s)}\nRouter reason: {_get(s, 'decision', 'reason')}"
+    trace = _get(s, "analysis", "decision_trace", default=None)
+    if not trace:                                                   # pre-v3.4.0 snapshot
+        header = f"**[{s.get('go_status')}] [{_get(s, 'decision', 'action')}]** {state.local(s.get('timestamp'))} · {s.get('session')}"
+        return f"{header}\n{why_text(s)}\nRouter reason: {_get(s, 'decision', 'reason')}"
+    lines = [f"**{trace.get('title')}**", trace.get("sentence", ""), ""]
+    for g in trace.get("gates") or []:
+        lines.append(f"{g.get('mark')} **{g.get('label')}** · {g.get('value')}")
+    flips = trace.get("flips") or []
+    lines.append("")
+    lines.append("**What flips it**")
+    lines.extend(f"{i}. {f}" for i, f in enumerate(flips, 1)) if flips else lines.append("Nothing is blocking — the gates are clear.")
+    return "\n".join(x for x in lines if x is not None)
 
 
 def fmt_clock(state: BotState) -> str:
@@ -386,12 +396,13 @@ def dispatch(state: BotState, text: str, prefix: str = "!") -> str | dict[str, A
         return None
     cmd, args = parts[0].lower(), parts[1:]
     try:
-        if cmd == "status":
+        if cmd in {"status", "decision"}:
             snap = state.latest_snapshot()
-            return status_card(snap, str(state.tz)) if snap else fmt_status(state)   # embed card (v3.2.0)
+            return decision_card(snap, str(state.tz)) if snap else fmt_status(state)   # THE card (v3.4.0)
         if cmd in {"detected", "patterns", "seen"}:
             snap = state.latest_snapshot()
-            return detections_card(snap, str(state.tz)) if snap else "No snapshot yet."
+            full = bool(args) and str(args[0]).lower() in {"full", "all", "long"}
+            return detections_card(snap, str(state.tz), full=full) if snap else "No snapshot yet."
         if cmd in {"why", "blocked"}: return fmt_why(state)
         if cmd in {"clock", "time"}: return fmt_clock(state)
         if cmd == "text": return fmt_status(state)

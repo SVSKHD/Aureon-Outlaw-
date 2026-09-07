@@ -103,7 +103,10 @@ class Discord:
         self._last_detection_sig = sig
         if self.status_mode == "events":
             return                                                                                   # v3.1.1: status only on request (!status)
-        key = f"{s.decision.action.value}|{s.entry_state.value}|{s.pa_side}|{s.session.value}|{s.go_status}"
+        # v3.4.0: the decision card is pushed when the VERDICT or the blocking gate changes, not just the action.
+        trace = ((d.get("analysis") or {}).get("decision_trace") or {}) if isinstance(d, dict) else {}
+        key = (f"{s.decision.action.value}|{s.entry_state.value}|{s.pa_side}|{s.session.value}|{s.go_status}"
+               f"|{trace.get('verdict')}|{trace.get('blocking_gate')}")
         if key != self._last_key or (self.status_mode == "interval" and now - self._last_status >= self.min_interval):
             if self.send(embed=status_card(d, tz)):
                 self._last_key, self._last_status = key, now

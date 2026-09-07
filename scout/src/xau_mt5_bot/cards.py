@@ -96,8 +96,57 @@ def _fields(*pairs: tuple[str, str, bool]) -> list[dict[str, Any]]:
     return [{"name": n, "value": (v or "—")[:1024], "inline": i} for n, v, i in pairs]
 
 
+COLOURS = {"green": GREEN, "amber": AMBER, "red": RED, "grey": GREY}
+
+
+def _gate_block(gates: list[dict], limit: int = 14) -> str:
+    """The checklist, first-blocking row included, in evaluation order."""
+    return "\n".join(f"{g.get('mark', '—')} {g.get('label')} · {g.get('value')}" for g in gates[:limit])
+
+
+def decision_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
+    """v3.4.0: THE status card — verdict, one-sentence why, the gate checklist, what flips it, evidence, levels."""
+    trace = _g(s, "analysis", "decision_trace", default=None)
+    if not trace:                                                   # pre-v3.4.0 snapshot: fall back to the old layout
+        return legacy_status_card(s, tz)
+    levels = trace.get("levels") or {}
+    footer = trace.get("footer") or {}
+    flips = trace.get("flips") or []
+    flip_text = "\n".join(f"{i}. {f}" for i, f in enumerate(flips, 1)) or "Nothing is blocking — the gates are clear."
+    zone_line = (f"{_f(levels.get('zone_low'))}–{_f(levels.get('zone_high'))} {levels.get('zone_kind') or ''}".strip()
+                 if levels.get("zone_low") is not None else "no zone selected")
+    tp1 = (f"{_f(levels.get('take_profit_1'))}"
+           + (f" ({_f(levels.get('take_profit_1_rr'))}R)" if levels.get("take_profit_1_rr") is not None else "")
+           ) if levels.get("take_profit_1") is not None else "n/a"
+    remaining = footer.get("remaining_vetoes") or []
+    footer_text = (f"GO today: {footer.get('go_today', 'n/a')} "
+                   f"({footer.get('go_cycles', 0)}/{footer.get('cycles_observed', 0)} cycles) · "
+                   f"calibration {footer.get('calibration', 'n/a')}\n"
+                   + (f"Still to clear after the zone: {', '.join(remaining)}\n" if remaining else "")
+                   + str(footer.get("hint", "")))
+    return {
+        "title": trace.get("title", ""),
+        "description": trace.get("sentence", ""),
+        "color": COLOURS.get(trace.get("colour"), GREY),
+        "fields": _fields(
+            ("Gates", _gate_block(trace.get("gates") or []), False),
+            ("What flips it", flip_text, False),
+            ("Evidence FOR", "\n".join(trace.get("evidence_for") or []) or "none", True),
+            ("Evidence AGAINST", "\n".join(trace.get("evidence_against") or []) or "none", True),
+            ("Levels", f"price {_f(levels.get('price'))} · zone {zone_line}\n"
+                       f"SL {_f(levels.get('stop_loss'))} · TP1 {tp1} · ATR {_f(levels.get('atr'), 3)}", False),
+        ),
+        "footer": {"text": footer_text[:2048]},
+    }
+
+
 def status_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
-    """[GO] / [NO-GO] card: what the router decided and why, in one screen."""
+    """The status card IS the decision card (v3.4.0)."""
+    return decision_card(s, tz)
+
+
+def legacy_status_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
+    """[GO] / [NO-GO] card as shipped before v3.4.0 — kept for snapshots with no decision_trace."""
     go = str(s.get("go_status", "NO-GO")); action = str(_g(s, "decision", "action", default="NO_TRADE"))
     pa = s.get("pa_side") or "NEUTRAL"; conf = s.get("confluence", 0)
     colour = GREEN if go == "GO" and action in {"LONG", "SHORT"} else (AMBER if action == "WAIT" else (GREY if go == "GO" else RED))
@@ -156,19 +205,11 @@ def _sweep_lines(sweeps: list[dict], tz: str, limit: int = 6) -> list[str]:
     return [line for _, line in entries[:limit]]
 
 
-def detections_card(s: dict[str, Any], tz: str, limit: int = 8) -> dict[str, Any]:
-    """What the engine currently sees: candle/chart patterns, structure events, sweeps, live zones."""
-    pats = s.get("patterns") or []
-    pat_lines = [f"{_t(p.get('timestamp'), tz)} {p.get('name') or p.get('event')}" + (f" ({p.get('timeframe')})" if p.get("timeframe") else "") for p in pats[-limit:]]
-    ev_lines = []
-    for tf in ("H4", "H1", "M15", "M5"):
-        for e in (_g(s, "structures", tf, "events", default=[]) or [])[-2:]:            # two newest per timeframe
-            ev_lines.append(f"{tf} {e.get('event')} @ {_f(e.get('level'))} {_t(e.get('timestamp'), tz)}")
-    sweeps = _sweep_lines(s.get("sweeps") or [], tz)
+def _zone_lines(s: dict[str, Any], limit: int = 5) -> list[str]:
     atr = _g(s, "analysis", "atr")
     price = s.get("bid")
-    zones = []
-    for z in (s.get("zones") or [])[:5]:
+    lines = []
+    for z in (s.get("zones") or [])[:limit]:
         distance = ""
         try:
             mid = (float(z.get("low")) + float(z.get("high"))) / 2
@@ -176,17 +217,51 @@ def detections_card(s: dict[str, Any], tz: str, limit: int = 8) -> dict[str, Any
             distance = f" · {gap / float(atr):.2f} ATR away" if atr else f" · {gap:.2f} away"
         except (TypeError, ValueError, ZeroDivisionError):
             distance = ""
-        zones.append(f"{z.get('side')} {z.get('kind')} {_f(z.get('low'))}–{_f(z.get('high'))} · score {_f(z.get('score'), 1)} · {z.get('status')}{distance}")
+        lines.append(f"{z.get('side')} {z.get('kind')} {_f(z.get('low'))}–{_f(z.get('high'))} · score {_f(z.get('score'), 1)} · {z.get('status')}{distance}")
+    return lines
+
+
+def detections_card(s: dict[str, Any], tz: str, limit: int = 8, full: bool = False) -> dict[str, Any]:
+    """v3.4.0: a compact companion to the decision card. `!detected full` restores the long form."""
+    pats = s.get("patterns") or []
+    bias = s.get("pa_side")
+    structure_line = " ".join(
+        f"{tf} {'▲' if _g(s, 'structures', tf, 'state') == 'BULLISH' else '▼' if _g(s, 'structures', tf, 'state') == 'BEARISH' else '•'}"
+        for tf in ("D1", "H4", "H1", "M15", "M5"))
+    if not full:
+        # 3 newest patterns, 3 newest sweeps on the bias side, zones with ATR distance — nothing else.
+        pat_lines = [f"{_t(p.get('timestamp'), tz)} {p.get('name') or p.get('event')}"
+                     + (f" ({p.get('timeframe')})" if p.get("timeframe") else "") for p in pats[-3:]]
+        wanted = "BULLISH" if bias == "LONG" else "BEARISH" if bias == "SHORT" else None
+        relevant = [sw for sw in (s.get("sweeps") or [])
+                    if sw.get("active", True) and (wanted is None or sw.get("direction") == wanted)]
+        return {
+            "title": f"🔍 Detected · {s.get('session')} · {_t(s.get('timestamp'), tz)}",
+            "color": PURPLE,
+            "description": structure_line,
+            "fields": _fields(
+                ("Newest patterns", "\n".join(pat_lines), False),
+                (f"Sweeps on the {bias or 'neutral'} side", "\n".join(_sweep_lines(relevant, tz, limit=3)), False),
+                ("Zones (distance in ATR)", "\n".join(_zone_lines(s)), False),
+            ),
+            "footer": {"text": f"PA {bias or 'NEUTRAL'} {s.get('confluence')}/100 · `!detected full` for everything · `!why` for the gates"},
+        }
+    pat_lines = [f"{_t(p.get('timestamp'), tz)} {p.get('name') or p.get('event')}" + (f" ({p.get('timeframe')})" if p.get("timeframe") else "") for p in pats[-limit:]]
+    ev_lines = []
+    for tf in ("H4", "H1", "M15", "M5"):
+        for e in (_g(s, "structures", tf, "events", default=[]) or [])[-2:]:            # two newest per timeframe
+            ev_lines.append(f"{tf} {e.get('event')} @ {_f(e.get('level'))} {_t(e.get('timestamp'), tz)}")
     return {
-        "title": f"🔍 Detected · {s.get('session')} · {_t(s.get('timestamp'), tz)}",
+        "title": f"🔍 Detected (full) · {s.get('session')} · {_t(s.get('timestamp'), tz)}",
         "color": PURPLE,
+        "description": structure_line,
         "fields": _fields(
             ("Candle / chart patterns", "\n".join(pat_lines), False),
             ("Structure events (2 newest / TF)", "\n".join(ev_lines), False),
-            ("Active sweeps (6 newest)", "\n".join(sweeps), False),
-            ("Zones (best first, distance in ATR)", "\n".join(zones), False),
+            ("Active sweeps (6 newest)", "\n".join(_sweep_lines(s.get("sweeps") or [], tz)), False),
+            ("Zones (best first, distance in ATR)", "\n".join(_zone_lines(s)), False),
         ),
-        "footer": {"text": f"PA {s.get('pa_side') or 'NEUTRAL'} {s.get('confluence')}/100 · {len(pats)} patterns · {len(s.get('sweeps') or [])} sweeps · {len(s.get('zones') or [])} zones"},
+        "footer": {"text": f"PA {bias or 'NEUTRAL'} {s.get('confluence')}/100 · {len(pats)} patterns · {len(s.get('sweeps') or [])} sweeps · {len(s.get('zones') or [])} zones"},
     }
 
 
@@ -328,20 +403,41 @@ def order_card(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
               "pa_trail": "📈 Trailing stop moved", "pa_close": "🏁 Position closed", "trade_closed": "🏁 Trade closed",
               "pa_breakeven_retry": "🔒 SL moved to break-even (retry)", "pa_tp2_lock_retry": "💰 TP2 SL lock (retry)"}
     if kind in {"order", "order_withheld"}:
+        # v3.4.0: same skeleton as the decision card — title, verdict sentence, the gates it cleared, the plan.
         rejected = kind == "order" and payload.get("success") is False
-        title = f"🔴 ORDER REJECTED · {side}" if rejected else titles[kind]
+        placed = kind == "order" and not rejected
+        title = (f"🔴 ORDER REJECTED · {side}" if rejected else
+                 f"🟢 {side} PLACED · #{payload.get('ticket', 'n/a')} · {payload.get('volume', 'n/a')} lot" if placed
+                 else titles[kind])
+        sentence = (f"{side} filled at {_f(payload.get('entry') or payload.get('price'))} risking "
+                    f"{_f(payload.get('risk_currency'))} with stop {_f(payload.get('stop_loss') or payload.get('sl'))}. "
+                    f"Targets {_tp_text(payload)}." if placed
+                    else str(payload.get("reason") or payload.get("message") or ""))
+        gates_cleared = "\n".join([
+            f"✅ Data fresh · {_f(payload.get('m1_age_seconds'), 0)}s · {payload.get('freshness', 'n/a')}",
+            f"✅ Spread · {_f(payload.get('spread'))} / {_f(payload.get('max_spread'))}",
+            f"✅ Confluence · {payload.get('confluence', 'n/a')} / {payload.get('min_confluence', 'n/a')}",
+            f"✅ Trigger · {payload.get('trigger_reason', 'n/a')}",
+            f"✅ Risk-reward · {_f(payload.get('rr'))} / {_f(payload.get('min_rr'))} · target {payload.get('target_realism', 'n/a')}",
+        ])
+        management = (f"TP1 closes {payload.get('partial_tp1_percent', 0)}% then SL → break-even at "
+                      f"{_f(payload.get('breakeven_at_rr'), 1)}R\n"
+                      f"TP2 closes {payload.get('partial_tp2_percent', 0)}% and locks SL at TP1 · runner trails from "
+                      f"{_f(payload.get('trailing_start_rr'), 1)}R\nInvalidation: {payload.get('invalidation', 'n/a')}")
         return {"title": title, "color": RED if rejected else (colour if kind == "order" else AMBER),
-                "description": str(payload.get("reason") or payload.get("message") or ""),
+                "description": sentence,
                 "fields": _fields(
                     ("Ticket / entry", f"#{payload.get('ticket', 'n/a')} @ {_f(payload.get('entry') or payload.get('price'))}", True),
                     ("Volume / risk", f"{payload.get('volume', 'n/a')} lot · risk {_f(payload.get('risk_currency'))} {payload.get('currency', '')}".strip(), True),
                     ("Stop loss", _f(payload.get("stop_loss") or payload.get("sl")), True),
                     ("Take profits", _tp_text(payload), False),
+                    ("Gates cleared", gates_cleared, False),
+                    ("Management plan", management, False),
                     ("Zone / trigger", f"{payload.get('zone_kind', 'n/a')} · {payload.get('trigger_reason', 'n/a')}", False),
                     ("Confluence / scouts", f"{payload.get('confluence', 'n/a')}/100 · scouts {payload.get('scout_verdict', 'n/a')} "
                                             f"{payload.get('scout_strength', 0)}/10 (leader {payload.get('scout_leader', 'n/a')})", False),
-                    ("Silver", str(payload.get("silver") or payload.get("intermarket") or "n/a"), False),
-                )}
+                ),
+                "footer": {"text": f"Silver: {payload.get('silver') or payload.get('intermarket') or 'n/a'} · demo only"}}
     if kind in {"pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close", "trade_closed",
                 "pa_breakeven_retry", "pa_tp2_lock_retry"}:
         return {"title": titles[kind], "color": colour,

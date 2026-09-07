@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xau-mt5-pa-bot"
-version = "3.3.0"
+version = "3.4.0"
 description = "Auditable XAUUSD price-action and session-scout bot for MetaTrader 5"
 readme = "README.md"
 requires-python = ">=3.11"

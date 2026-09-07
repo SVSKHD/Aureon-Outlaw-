@@ -91,11 +91,18 @@ def test_discord_commands_answer_from_bot_files(tmp_path):
     engine.shutdown()
     state = BotState(tmp_path)
     status = dispatch(state, "!status")
-    assert isinstance(status, dict) and status["title"].split(" · ")[1] in {"LONG", "SHORT", "WAIT", "NO TRADE"} and "COUPLED" in status["fields"][2]["value"]
+    assert isinstance(status, dict)
+    verdict = status["title"].split(" · ")[0].split(" ", 1)[1]                       # strip the emoji
+    assert verdict in {"LONG PLACED", "LONG GO", "SHORT GO", "WAIT", "NO TRADE", "CLOSED"}, status["title"]
+    gates = {f["name"]: f["value"] for f in status["fields"]}["Gates"]
+    assert gates.count("\n") == 13 and ("❌" in gates or gates.count("✅") == 14)     # 14 rows, at most one blocker
     text = dispatch(state, "!text")
     assert text.startswith("**[") and "Silver: COUPLED" in text
     det = dispatch(state, "!detected")
-    assert isinstance(det, dict) and det["title"].startswith("🔍") and len(det["fields"]) == 4
+    assert isinstance(det, dict) and det["title"].startswith("🔍") and len(det["fields"]) == 3   # compact (v3.4.0)
+    assert det["description"].startswith("D1 ") and det["description"].count(" ") == 9           # structure strip
+    full = dispatch(state, "!detected full")
+    assert isinstance(full, dict) and "full" in full["title"] and len(full["fields"]) == 4
     assert "XAU/XAGUSD" in dispatch(state, "!silver") and "COUPLED" in dispatch(state, "!silver")
     assert "GO tallies" in dispatch(state, "!go")
     assert "realised P/L" in dispatch(state, "!day")
@@ -250,7 +257,7 @@ def test_order_cards_carry_the_plan_and_the_running_result():
     assert fields["Take profits"] == "TP1 2504.00 (1.00R) · TP2 2508.00 (2.10R) · TP3 2515.00 (4.10R)"
     assert "DEMAND_OB" in fields["Zone / trigger"] and "M1 engulfing reclaim" in fields["Zone / trigger"]
     assert "72/100" in fields["Confluence / scouts"] and "SUPPORTS 6/10" in fields["Confluence / scouts"]
-    assert "COUPLED" in fields["Silver"]
+    assert "COUPLED" in placed["footer"]["text"]
     rejected = order_card("order", {"side": "LONG", "success": False, "retcode": 10019,
                                     "message": "Not enough money", "entry": 2500.5})
     assert rejected["title"] == "🔴 ORDER REJECTED · LONG" and rejected["color"] == 0xD85A30
@@ -300,7 +307,7 @@ def test_detections_card_collapses_round_sweeps_and_shows_zone_distance():
             "structures": {"M5": {"events": [{"event": "BOS", "level": 4405.0, "timestamp": "2026-09-07T07:50:00+00:00"},
                                              {"event": "CHOCH", "level": 4402.0, "timestamp": "2026-09-07T07:55:00+00:00"},
                                              {"event": "BOS", "level": 4400.0, "timestamp": "2026-09-07T07:58:00+00:00"}]}}}
-    card = detections_card(snap, "UTC")
+    card = detections_card(snap, "UTC", full=True)
     fields = {f["name"]: f["value"] for f in card["fields"]}
     sweep_lines = fields["Active sweeps (6 newest)"].split("\n")
     assert len(sweep_lines) == 6

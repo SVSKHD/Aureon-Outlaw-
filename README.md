@@ -105,6 +105,27 @@ Conservative extension points (not claimed as production-calibrated):
 
 See `EXAMPLE_REPORTS.md` for LONG, SHORT, WAIT and active-position output examples.
 
+## v3.4.0 — the decision card (Sep 7 2026)
+
+One card answers "go or not" in a glance. `decision_router.explain_decision()` builds a `DecisionExplanation`
+once per cycle, the engine stores it as `analysis.decision_trace`, and the webhook, `!status` and `!why` all
+render the same thing. No strategy weight or threshold changed — the trace only reports the decision already made.
+
+- **Gate checklist**: fourteen gates in evaluation order — data, clock+account, spread, confluence, side gap,
+  zone, trigger, pace, scouts, RR, target, $ session target, risk locks, session time — each with its measured
+  value against its threshold. Exactly one row can be `❌`: the **first** gate that fails. Rows before it are
+  `✅`, rows after are `—`, because the router never got that far.
+- **Verdict**: `PLACED` (green, with ticket and lot), `GO` (green, every gate clear but nothing sent),
+  `WAIT` (amber, setup alive), `NO_TRADE` (red), `CLOSED` (grey).
+  Titles read `🟠 WAIT · LONG bias 58/100 · inside zone, trigger pending · ASIA · 05:00`.
+- **Verdict sentence** in ≤ 30 words with the numbers; **What flips it** as up to 3 concrete numbered
+  conditions; **Evidence** split FOR/AGAINST by confluence family and applied penalty; **Levels** (price,
+  zone, SL, TP1 with R); **Footer** with today's GO tally and what would still block once price reaches the zone.
+- Order cards reuse the skeleton (ticket/lot title, entry + risk + every TP with R, the five gates cleared,
+  the management plan, silver footer). The Detected card is now compact — structure strip, 3 newest patterns,
+  3 newest sweeps on the bias side, zones in ATR — with `!detected full` for everything.
+- 269 passing tests. See `RELEASE_NOTES_v3.4.0.md`.
+
 ## v3.3.0 — broker clock offset + self-explanatory cards (Sep 7 2026)
 
 **Why scouts were never placed.** MetaTrader5 reports `symbol_info_tick().time`, `copy_rates_*()['time']`, deal times
