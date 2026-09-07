@@ -1,5 +1,7 @@
 # XAUUSD Price-Action + Session-Scout Bot for MetaTrader 5
 
+**Windows setup and running both scripts:** [README_RUN.md](README_RUN.md). Run `setup.bat` once to install MT5 and Discord dependencies, then configure `.env` before starting the launchers.
+
 This project implements the attached specification as a modular Python bot connected to the MetaTrader 5 desktop terminal. The deterministic price-action engine is primary; paired session scouts are supporting evidence; one final router is the only component allowed to authorize a directional PA order.
 
 The execution defaults are demo-only:
