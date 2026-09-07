@@ -113,7 +113,9 @@ See `EXAMPLE_REPORTS.md` for LONG, SHORT, WAIT and active-position output exampl
   hourly and on reconnect, DST steps only after the first detection) and applies it to every tick,
   bar and deal time, so the rest of the bot works in true UTC. The guard acts on the RESIDUAL skew,
   which is the real fault. `safety.broker_utc_offset_hours: null` auto-detects; a whole/half-hour
-  value pins it.
+  value pins it (as does the older `broker_timestamp_offset_seconds`). Detection is narrow on
+  purpose: only a difference within 120 s of a whole/half hour counts as a timezone, so a wrong PC
+  clock is never absorbed — it still blocks orders. Merged with the manual-offset work from PR #2.
 - **The decision explains itself**: `snapshot.analysis.decision_trace` carries a one-sentence verdict,
   all 17 router gates in order with value/threshold, what would flip each failed gate, and the three
   strongest confluence families per side. Printed every cycle, on the status card
@@ -127,7 +129,7 @@ See `EXAMPLE_REPORTS.md` for LONG, SHORT, WAIT and active-position output exampl
   Still no order commands, by design.
 - Fixed a Python 3.11 f-string syntax error in `cards.py` / `discord_bot.py` that made the package
   unimportable on the supported runtime. Added `.gitignore`; `__pycache__` is no longer committed.
-- 263 passing tests. See `RELEASE_NOTES_v3.3.0.md`.
+- 275 passing tests. See `RELEASE_NOTES_v3.3.0.md`.
 
 ## v3.1.0 — silver correlation + Discord commands (Sep 6 2026)
 

@@ -23,8 +23,9 @@ read them as UTC (`mt5_client.py` `get_tick` / `get_bars`), so:
 `mt5_client.BrokerClock` converts broker-server time to true UTC, and everything downstream sees
 only true UTC:
 
-* the offset is measured at startup/`validate_terminal` from one tick, rounded to the nearest
-  30 minutes (server timezones are whole or half hours);
+* the offset is measured at startup/`validate_terminal` from one tick and rounded to the nearest
+  30 minutes (server timezones are whole or half hours). It is adopted **only** if the raw difference
+  is within 120 s of that grid — an arbitrary difference is a broken PC clock, never a timezone;
 * it is re-measured at most once an hour, and on every reconnect. After the first detection the
   offset only moves for a **DST step** — a whole number of hours that leaves under a minute behind.
   Any other difference stays visible as residual skew instead of being absorbed into a new
@@ -100,7 +101,29 @@ Firestore. GO/NO-GO now also states in one line what GO means, so it is never re
 There are still **no order commands**, by design: the trading loop's router is the only
 authorisation point.
 
-## 5. Also in this release
+## 5. Merged with the manual-offset fix (PR #2)
+
+PR #2 landed on `master` while this work was in flight, attacking the same failure with a **manual**
+`safety.broker_timestamp_offset_seconds` plus stricter guards. Both are kept:
+
+* an offset is adopted automatically **only** when the broker-minus-system difference sits within
+  120 s of the half-hour grid every MT5 server timezone lives on. A broken PC clock produces an
+  arbitrary difference and is never absorbed into an invented offset — it stays as residual skew and
+  blocks orders, which is exactly what PR #2 set out to protect;
+* a tick still in the future after the offset is refused at startup, and the clock window is
+  asymmetric (a lag is normal, a future tick is not);
+* `broker_timestamp_offset_seconds` still works as the manual form and is honoured whenever
+  `broker_utc_offset_hours` is null; the hours key wins when both are set;
+* PR #2's manual-readiness status card (READY / WAIT title, manual entry-SL-targets, next pattern to
+  watch, fakeout assessment, validity note), hourly/off Discord status modes, the `allow_pa_orders`
+  execution gate and `tools/diagnose_clock.py` are all retained, with the decision trace added on top.
+
+One test changed meaning deliberately: `test_future_tick_rejected_without_guessing_offset` asserted
+that even an exact +3 h server must be refused, which would keep the reported failure alive. It is now
+`test_off_grid_future_tick_is_rejected_not_guessed_as_a_timezone` — a 25-minute future tick is still
+refused, an exact timezone is detected.
+
+## 6. Also in this release
 
 * **Python 3.11 fix**: `cards.py` and `discord_bot.py` used nested same-type quotes inside an
   f-string, which only parses on 3.12+. On the supported 3.11 runtime the whole package — and the
@@ -109,7 +132,8 @@ authorisation point.
 * Firestore `SCHEMA_VERSION` 3.3.0, `FIRESTORE_SCHEMA.json` adds `analysis.decision_trace`,
   `analysis.broker_clock` and `price.broker_utc_offset_hours`.
 * Version 3.3.0 in `pyproject.toml` and `__init__.py`.
-* Tests: 216 → 263, all passing (`test_v33_broker_clock.py`, `test_v33_decision_and_cards.py`).
+* Tests: 216 → 275, all passing (`test_v33_broker_clock.py`, `test_v33_decision_and_cards.py`, plus
+  PR #2's `test_clock_decision_cards.py`).
 
 ## Upgrading
 

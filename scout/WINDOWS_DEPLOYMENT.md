@@ -119,7 +119,13 @@ deal time to UTC before anything else looks at them.
 * **Nothing to configure.** `safety.broker_utc_offset_hours: null` means auto-detect.
 * Pin it only if you have a reason to: `broker_utc_offset_hours: 3` for a UTC+3 server (whole or half
   hours). A pinned value that disagrees with the server shows up as residual skew and blocks orders,
-  so a wrong value is never silent.
+  so a wrong value is never silent. The older `broker_timestamp_offset_seconds` still works and is
+  used whenever `broker_utc_offset_hours` is null.
+* Detection is deliberately narrow: the difference must land within 120 seconds of a whole or half
+  hour. A PC clock that is simply wrong does not look like a timezone, so it is never absorbed —
+  it blocks orders until you fix it. `tools\diagnose_clock.py` prints the raw evidence.
+* A tick that is still in the future after the offset is refused at startup, and the guard window is
+  asymmetric: a small lag is normal, a tick ahead of your clock is not.
 * `safety.max_clock_skew_seconds` (default 600) applies to the **residual** skew after the offset —
   i.e. to a genuinely wrong Windows clock. If orders are blocked with
   `broker clock skew … (residual after broker offset …)`, fix the PC clock:
