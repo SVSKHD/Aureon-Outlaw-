@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,11 +8,21 @@ import pandas as pd
 import pytest
 
 from xau_mt5_bot.config import load_config
-from xau_mt5_bot.mt5_client import AccountState, OrderResult, Tick
+from xau_mt5_bot.mt5_client import AccountState, BrokerClock, OrderResult, Tick
 
 
 class FakeClient:
-    def __init__(self, hedging: bool = True, demo: bool = True) -> None:
+    """In-memory MT5 stand-in.
+
+    `self.tick` is the TRUE-UTC state of the fake market. `broker_offset_hours` simulates a
+    server that stamps its ticks and bars in its own timezone (a UTC+3 broker → 3.0), and
+    `extra_skew_seconds` simulates a genuinely wrong clock on top of that offset. Like the real
+    client, everything handed out of `get_tick`/`get_bars` has already been converted to UTC,
+    so a correctly detected offset is invisible downstream and only the residual skew remains.
+    """
+
+    def __init__(self, hedging: bool = True, demo: bool = True, broker_offset_hours: float = 0.0,
+                 extra_skew_seconds: float = 0.0, manual_offset_hours: float | None = None) -> None:
         self.hedging = hedging
         self.demo = demo
         self._positions: list[SimpleNamespace] = []
@@ -21,6 +31,37 @@ class FakeClient:
         self.closed: list[tuple[int, int]] = []
         self.deals: dict[int, list[dict]] = {}
         self.sent: list[dict] = []
+        self.broker_offset_hours = float(broker_offset_hours)
+        self.extra_skew_seconds = float(extra_skew_seconds)
+        self.clock = BrokerClock.from_hours(manual_offset_hours)
+        self.server = "FakeBroker-Demo"
+        self.bar_frames: dict[str, pd.DataFrame] = {}      # true-UTC bars the fake market has produced
+        self.bar_calls: list[tuple[str, str, int]] = []
+
+    # ---- broker clock simulation -------------------------------------------------------------
+    def system_utc_now(self) -> datetime:
+        """The PC clock as the fake bot sees it (the fake market's true UTC unless a test moves it)."""
+        return getattr(self, "now", None) or self.tick.time
+
+    def _broker_shift(self) -> timedelta:
+        return timedelta(hours=self.broker_offset_hours, seconds=self.extra_skew_seconds)
+
+    def raw_tick_epoch(self) -> float:
+        """What MetaTrader5 would return from symbol_info_tick().time — broker-server seconds."""
+        return (self.tick.time + self._broker_shift()).timestamp()
+
+    def raw_bars(self, timeframe: str) -> pd.DataFrame:
+        """What copy_rates_from_pos() would return — bar stamps in broker-server time."""
+        frame = self.bar_frames[timeframe].copy()
+        frame["time"] = pd.to_datetime(frame["time"], utc=True) + timedelta(hours=self.broker_offset_hours)
+        return frame
+
+    def measure_broker_clock(self) -> BrokerClock:
+        return self.clock.measure(self.raw_tick_epoch(), self.system_utc_now(), self.server)
+
+    def refresh_broker_clock(self) -> BrokerClock:
+        now = self.system_utc_now()
+        return self.measure_broker_clock() if self.clock.needs_measurement(now) else self.clock
 
     def account_state(self) -> AccountState:
         return AccountState(1, 50000, 50000, 45000, True, self.demo, self.hedging)
@@ -30,10 +71,19 @@ class FakeClient:
                                trade_tick_size=0.01, trade_tick_value=1.0, trade_stops_level=0, trade_freeze_level=0)
 
     def get_tick(self, symbol: str) -> Tick:
-        return self.tick
+        if not self.broker_offset_hours and not self.extra_skew_seconds and not self.clock.manual:
+            return self.tick
+        self.refresh_broker_clock()
+        return Tick(self.clock.to_utc(self.raw_tick_epoch()), self.tick.bid, self.tick.ask)
 
     def get_bars(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
-        raise NotImplementedError
+        self.bar_calls.append((symbol, timeframe, count))
+        if timeframe not in self.bar_frames:
+            raise NotImplementedError
+        self.refresh_broker_clock()
+        frame = self.raw_bars(timeframe)
+        frame["time"] = pd.to_datetime(frame["time"], utc=True) - self.clock.offset      # the single conversion point
+        return frame.sort_values("time").tail(count).reset_index(drop=True)
 
     def positions(self, symbol: str | None = None, magic: int | None = None):
         values = [p for p in self._positions if symbol is None or p.symbol == symbol]

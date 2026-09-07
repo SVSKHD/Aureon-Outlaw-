@@ -7,7 +7,7 @@ from typing import Any, Callable
 from .config import BotConfig
 from .models import ScoutSnapshot, ScoutVerdict, SessionName, Side
 from .execution import account_is_safe, normalize_price, normalize_volume, send_with_retry
-from .mt5_client import OrderResult, TradingClient
+from .mt5_client import OrderResult, TradingClient, broker_epoch_to_utc
 from .sessions import SessionBoundary
 
 
@@ -148,7 +148,7 @@ class ScoutManager:
                 self.current_session = session
                 self.session_open_price = sum(float(p.price_open) for p in positions) / len(positions)
                 t = getattr(positions[0], "time", None)
-                self.session_open_time = datetime.fromtimestamp(int(t), tz=UTC) if isinstance(t, (int, float)) else now.astimezone(UTC)
+                self.session_open_time = broker_epoch_to_utc(self.client, int(t)) if isinstance(t, (int, float)) else now.astimezone(UTC)   # v3.3.0
                 adopted = True
                 self.audit("scout_adopted", {"session": session.value, "tickets": [int(p.ticket) for p in positions], "legs": len(positions),
                                              "mfe_mae_restored": [int(p.ticket) in self.extrema for p in positions]})

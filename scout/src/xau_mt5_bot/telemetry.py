@@ -18,9 +18,13 @@ class Telemetry:
         self.errors: deque[str] = deque(maxlen=50)
         self.cycles = 0; self.error_count = 0; self.started = time.time(); self._last_flush = 0.0
         self.last: dict[str, Any] = {}
+        self.broker_clock: dict[str, Any] = {}          # v3.3.0: detected broker offset, visible in heartbeat.json
 
     def record_cycle(self, ms: float, snapshot_summary: dict[str, Any]) -> None:
         self.cycle_ms.append(ms); self.cycles += 1; self.last = snapshot_summary
+
+    def record_broker_clock(self, payload: dict[str, Any]) -> None:
+        self.broker_clock = dict(payload or {})
 
     def record_error(self, message: str) -> None:
         self.error_count += 1; self.errors.append(f"{datetime.now(UTC).isoformat()} {message[:300]}")
@@ -29,7 +33,13 @@ class Telemetry:
         ms = list(self.cycle_ms)
         return {"ts": datetime.now(UTC).isoformat(), "ts_epoch": time.time(), "pid": os.getpid(), "uptime_s": int(time.time() - self.started), "cycles": self.cycles,
                 "cycle_ms_avg": round(sum(ms) / len(ms), 1) if ms else None, "cycle_ms_max": round(max(ms), 1) if ms else None,
-                "errors": self.error_count, "last_errors": list(self.errors)[-5:], "last": self.last}
+                "errors": self.error_count, "last_errors": list(self.errors)[-5:], "last": self.last,
+                "broker_utc_offset_hours": self.broker_clock.get("broker_utc_offset_hours"),
+                "broker_clock_residual_seconds": self.broker_clock.get("residual_skew_seconds", self.broker_clock.get("broker_clock_residual_seconds")),
+                "broker_clock_source": self.broker_clock.get("broker_clock_source"),
+                "broker_clock_ok": self.broker_clock.get("clock_ok"),
+                "broker_server": self.broker_clock.get("broker_server"),
+                "broker_clock": self.broker_clock or None}
 
     def heartbeat(self, force: bool = False) -> dict[str, Any] | None:
         """Write heartbeat file every flush_seconds; the supervisor restarts the bot if this file goes stale."""

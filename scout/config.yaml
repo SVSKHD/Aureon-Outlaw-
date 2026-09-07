@@ -28,6 +28,11 @@ safety:
   retry_count: 1
   broker_market_stale_seconds: 180
   deal_history_max_days: 3650
+  # null = auto-detect the MT5 server timezone from the tick clock (recommended).
+  # Set a number only to pin it, e.g. 3 for a UTC+3 server: whole or half hours.
+  broker_utc_offset_hours: null
+  # Residual skew tolerated AFTER the broker offset is applied; above this, orders are blocked.
+  max_clock_skew_seconds: 600
 magic:
   scout_asia: 11001
   scout_london: 11002

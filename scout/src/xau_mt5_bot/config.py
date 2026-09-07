@@ -56,12 +56,21 @@ class SafetyConfig(BaseModel):
     one_pa_position_per_symbol: bool = True
     max_m1_age_seconds: int = Field(default=300, ge=60)
     retry_count: int = Field(default=1, ge=0, le=3)
-    max_clock_skew_seconds: int = Field(default=600, ge=60)
+    max_clock_skew_seconds: int = Field(default=600, ge=60)   # residual skew AFTER the broker offset is applied
+    broker_utc_offset_hours: float | None = Field(default=None, ge=-14, le=14)   # null = auto-detect (v3.3.0)
     transition_retry_limit: int = Field(default=5, ge=0)
     repair_missing_scout_leg: bool = True
     scout_repair_max_session_fraction: float = Field(default=0.5, ge=0, le=1)
     broker_market_stale_seconds: int = Field(default=180, ge=30)
     deal_history_max_days: int = Field(default=3650, ge=90)
+
+
+    @model_validator(mode="after")
+    def broker_offset_is_a_real_timezone(self) -> "SafetyConfig":
+        """A manual override must be a whole or half hour — MT5 server timezones always are (v3.3.0)."""
+        if self.broker_utc_offset_hours is not None and abs(self.broker_utc_offset_hours * 2 - round(self.broker_utc_offset_hours * 2)) > 1e-9:
+            raise ValueError("safety.broker_utc_offset_hours must be a whole or half hour (e.g. 3, 2.5, -5), or null to auto-detect")
+        return self
 
 
 class MagicConfig(BaseModel):

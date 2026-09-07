@@ -9,7 +9,7 @@ import pandas as pd
 from .candles import detect_candlestick_patterns
 from .charts import detect_chart_patterns
 from .config import BotConfig
-from .decision_router import final_decision_router
+from .decision_router import explain_decision, final_decision_router
 from .context import premium_discount, session_vwap, trendlines
 from .execution import account_is_safe, execute_pa_trade
 from .position_manager import PositionManager
@@ -71,6 +71,7 @@ class TradingEngine:
         self.pending_boundaries: list[tuple[SessionBoundary, int]] = []
         self._boundary_retry_after: dict[str, datetime] = {}
         self.clock_ok = True; self.clock_skew = 0.0
+        self.broker_offset_hours = 0.0; self.broker_clock_source = "assumed_utc"; self._last_offset_reported: float | None = None
         self.last_trigger = None; self.last_trigger_time = None
         self.active_setup_id: str | None = None
         self.account_key = ""
@@ -103,7 +104,8 @@ class TradingEngine:
     def orders_allowed(self) -> tuple[bool, str]:
         """Gate for every order: broker clock sane, market open, account safe, tick fresh."""
         if not self.clock_ok:
-            return False, f"broker clock skew {self.clock_skew:.0f}s > {self.config.safety.max_clock_skew_seconds}s"
+            return False, (f"broker clock skew {self.clock_skew:.0f}s > {self.config.safety.max_clock_skew_seconds}s "
+                           f"(residual after broker offset {self.broker_offset_hours:+.1f}h)")
         now = getattr(self, "cycle_now", None) or datetime.now(UTC)
         if not self.sessions.calendar_open(now):
             return False, "market closed by weekend/holiday/early-close calendar"
@@ -356,13 +358,34 @@ class TradingEngine:
         finally:
             self._finalizing = False
 
+    def broker_clock(self) -> dict[str, Any]:
+        """Live view of the single conversion point (v3.3.0) — used by the clock guard, cards and !clock."""
+        clock = getattr(self.client, "clock", None)
+        payload = clock.payload() if hasattr(clock, "payload") else {
+            "broker_utc_offset_hours": 0.0, "broker_clock_residual_seconds": 0.0,
+            "broker_clock_source": "assumed_utc", "broker_server": "", "broker_clock_measured_at": None}
+        return {**payload, "residual_skew_seconds": round(self.clock_skew, 1), "clock_ok": self.clock_ok,
+                "max_clock_skew_seconds": self.config.safety.max_clock_skew_seconds}
+
     def _validate_clock(self, now: datetime) -> None:
+        """The tick is already converted to true UTC by the client, so what is measured here is the
+        RESIDUAL skew after the broker timezone offset — a genuine clock fault, and the real guard (v3.3.0)."""
         tick = self.client.get_tick(self.config.symbol)
+        clock = getattr(self.client, "clock", None)
+        self.broker_offset_hours = float(getattr(clock, "offset_hours", 0.0) or 0.0)
+        self.broker_clock_source = str(getattr(clock, "source", "assumed_utc"))
         self.clock_skew = (tick.time - now).total_seconds()
         ok = abs(self.clock_skew) <= self.config.safety.max_clock_skew_seconds or not self.sessions.calendar_open(now)
+        if self._last_offset_reported != self.broker_offset_hours:                          # once per detected offset
+            self._last_offset_reported = self.broker_offset_hours
+            self.logger.event("broker_clock_offset", {
+                "broker_utc_offset_hours": self.broker_offset_hours, "source": self.broker_clock_source,
+                "residual_skew_seconds": round(self.clock_skew, 1), "server": str(getattr(clock, "server", "") or ""),
+                "message": f"MT5 server clock is UTC{self.broker_offset_hours:+g}h; all broker timestamps are converted to UTC"})
         if ok != self.clock_ok or self.last_cycle is None:
             self.logger.event("clock_check", {"tick_minus_system_seconds": round(self.clock_skew, 1), "ok": ok,
-                                              "message": "ok" if ok else "MT5 tick time far from system UTC — orders blocked; check broker timestamps / PC clock"})
+                                              "broker_utc_offset_hours": self.broker_offset_hours,
+                                              "message": "ok" if ok else "MT5 tick time far from system UTC AFTER the broker offset — orders blocked; check the PC clock / broker feed"})
         self.clock_ok = ok
 
     def _handle_sessions(self, now: datetime) -> None:
@@ -650,8 +673,10 @@ class TradingEngine:
         today = frames["M1"][pd.to_datetime(frames["M1"].time, utc=True) >= day_start]
         today_range = float(today.high.max() - today.low.min()) if not today.empty else 0.0
         middle = (tick.bid + tick.ask) / 2
+        direction_detail: dict[str, Any] = {}
         pa_side, confluence = self._price_action_direction(structures, sweeps, zones, patterns, m5_features, today_range, daily_atr,
-                                                           middle, atr, pd_info, vwap_info, intermarket)        # 17. current-cycle inputs
+                                                           middle, atr, pd_info, vwap_info, intermarket,
+                                                           detail=direction_detail)                             # 17. current-cycle inputs
         scout = self.scouts.snapshot(pa_side)
         if scout.verdict == ScoutVerdict.CONFIRMS:
             confluence = min(100, confluence + min(5, scout.strength // 2))
@@ -728,17 +753,16 @@ class TradingEngine:
             ok_setup, why_setup = self.positions.setup_allowed(setup_id or "unknown", now)                        # item 16
             if not ok_day or not ok_setup:
                 account_safe, safe_reason = False, why_day if not ok_day else why_setup
-        decision = final_decision_router(
-            DecisionInput(
-                pa_side, bool(selected), entry_state, trigger, scout, freshness, spread_state,
-                account_safe, plan.actual_rr[0] if plan and plan.actual_rr else None,
-                self.config.risk.min_actual_rr, plan.target_realism if plan else None,
-                confluence, self.config.analysis.min_confluence, setup_id,
-                self.config.scout_analysis.strong_contradiction_strength,
-                self.config.scout_analysis.hold_when_slow and
-                (scout.pace_calibrated or self.config.scout_analysis.hold_before_calibrated),
-            ), now,
+        router_input = DecisionInput(
+            pa_side, bool(selected), entry_state, trigger, scout, freshness, spread_state,
+            account_safe, plan.actual_rr[0] if plan and plan.actual_rr else None,
+            self.config.risk.min_actual_rr, plan.target_realism if plan else None,
+            confluence, self.config.analysis.min_confluence, setup_id,
+            self.config.scout_analysis.strong_contradiction_strength,
+            self.config.scout_analysis.hold_when_slow and
+            (scout.pace_calibrated or self.config.scout_analysis.hold_before_calibrated),
         )
+        decision = final_decision_router(router_input, now)
         snapshot = AnalysisSnapshot(
             now, self.config.symbol, self.sessions.session_at(now), tick.bid, tick.ask, spread,
             freshness, structures, patterns, liquidity, sweeps, selected_zones, pa_side,
@@ -790,6 +814,7 @@ class TradingEngine:
                                     "role": "SECONDARY_CONFIRMATION_ONLY"},
             "fakeout_risk": rel.get("fakeout_rate"), "remaining_session_minutes": round(remaining_minutes, 1),
             "intermarket": intermarket,                                                                            # v3.1.0
+            "broker_clock": self.broker_clock(),                                                                   # v3.3.0
         }
         if self.startup_cycle and decision.action.value in {"LONG", "SHORT"}:                                  # v2.0.0 item 7: never trade on the cold/reconnect cycle
             decision = Decision(Action.NO_TRADE, "Cold start: inputs captured before the synchronous history/pattern load; re-evaluating next cycle", now)
@@ -821,6 +846,25 @@ class TradingEngine:
             self.positions.track(p, "SCOUT", snapshot.session.value,
                                  tdate=self.sessions.broker_trading_date(now).isoformat())
         snapshot.active_positions = self.positions.status_reports(tick.bid, tick.ask)
+        selected_text = (f"{selected.kind} {selected.low:.2f}–{selected.high:.2f}" if selected else "no zone")
+        trace_context = {
+            "clock_ok": self.clock_ok, "residual_skew_seconds": self.clock_skew,
+            "max_clock_skew_seconds": self.config.safety.max_clock_skew_seconds,
+            "broker_utc_offset_hours": self.broker_offset_hours,
+            "account_reason": safe_reason, "spread": round(spread, 3), "max_spread_price": self.config.risk.max_spread_price,
+            "zone_text": selected_text, "side_gap": direction_detail.get("gap"), "min_side_gap": direction_detail.get("min_gap", 8),
+            "trigger_time": trigger.confirmation_timestamp.astimezone(UTC).strftime("%H:%M") if getattr(trigger, "confirmation_timestamp", None) else "",
+            "session_target_verdict": effective_target, "remaining_minutes": remaining_minutes, "session": snapshot.session.value,
+            "day_locked": bool(self.positions.day.get("locked")), "day_lock_reason": self.positions.day.get("locked"),
+            "setup_cooldown": bool(setup_id) and not self.positions.setup_allowed(setup_id or "unknown", now)[0],
+            "cooldown_reason": self.positions.setup_allowed(setup_id or "unknown", now)[1] if setup_id else "clear",
+            "position_open": any(p.get("kind") == "PA" for p in snapshot.active_positions) if snapshot.active_positions else bool(
+                self.client.positions(self.config.symbol, self.config.magic.pa)),
+            "direction_detail": direction_detail, "intermarket": intermarket,
+        }
+        trace = explain_decision(router_input, snapshot.decision, trace_context)                                    # v3.3.0
+        snapshot.analysis["decision_trace"] = trace
+        snapshot.analysis["blocked_by"] = trace["blocked_by"]
         strategy_samples = self.strategy_samples
         strategy_calibrated = strategy_samples >= self.config.analysis.min_strategy_sample_trades
         calibration_status = "CALIBRATED" if (strategy_calibrated and scout.pace_calibrated) else "COLLECTING"
@@ -1049,7 +1093,10 @@ class TradingEngine:
 
     @staticmethod
     def _price_action_direction(structures, sweeps, zones, patterns, m5=None, today_range=0.0, daily_atr=0.0,
-                                price=0.0, atr=1.0, pd_info=None, vwap_info=None, intermarket=None) -> tuple[Side | None, int]:
+                                price=0.0, atr=1.0, pd_info=None, vwap_info=None, intermarket=None,
+                                detail: dict[str, Any] | None = None) -> tuple[Side | None, int]:
+        """`detail`, when given, is filled with the per-family evidence behind both sides (v3.3.0):
+        the decision trace reports the strongest contributors instead of a bare score."""
         long_families = {"htf": 0, "structure": 0, "liquidity": 0, "location": 0, "momentum": 0, "candle": 0, "intermarket": 0}
         short_families = dict(long_families)
         weights = {"D1": 7, "H4": 7, "H1": 4, "M15": 2, "M5": 2}
@@ -1109,6 +1156,13 @@ class TradingEngine:
         if vwap_info and vwap_info.get("relation") == "above": long_score += 3
         if vwap_info and vwap_info.get("relation") == "below": short_score += 3
         long_score, short_score = max(0, min(100, long_score)), max(0, min(100, short_score))
+        if detail is not None:
+            detail.update({
+                "long_score": long_score, "short_score": short_score, "gap": abs(long_score - short_score), "min_gap": 8,
+                "long_families": {k: min(caps[k], max(0, v)) for k, v in long_families.items()},
+                "short_families": {k: min(caps[k], max(0, v)) for k, v in short_families.items()},
+                "caps": caps,
+            })
         if abs(long_score - short_score) < 8:
             return None, max(long_score, short_score)
         return (Side.LONG, long_score) if long_score > short_score else (Side.SHORT, short_score)

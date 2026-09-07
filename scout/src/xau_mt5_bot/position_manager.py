@@ -14,7 +14,7 @@ import pandas as pd
 
 from .config import BotConfig
 from .execution import normalize_price, normalize_volume
-from .mt5_client import TradingClient
+from .mt5_client import TradingClient, broker_epoch_to_utc
 
 
 class PositionManager:
@@ -130,7 +130,8 @@ class PositionManager:
     def track(self, position: Any, kind: str, session: str, invalidation_price: float | None = None, side: str | None = None,
               setup_id: str | None = None, plan: dict[str, Any] | None = None, tdate: str | None = None) -> None:
         t = getattr(position, "time", None)
-        open_time = datetime.fromtimestamp(int(t), tz=UTC) if isinstance(t, (int, float)) else datetime.now(UTC)
+        # v3.3.0: position.time is a BROKER-server epoch — converted through the client's single conversion point.
+        open_time = broker_epoch_to_utc(self.client, int(t)) if isinstance(t, (int, float)) else datetime.now(UTC)
         vol = float(position.volume)
         self.tracked[str(int(position.ticket))] = {
             "ticket": int(position.ticket), "kind": kind, "side": side or ("LONG" if int(getattr(position, "type", 0)) == 0 else "SHORT"),

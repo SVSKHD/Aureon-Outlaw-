@@ -87,7 +87,8 @@ def cli() -> int:
         if eligible:
             discord_box.put(_discord_then_mark, kind, payload, event_id)
     logger.event = fanout
-    client = MT5Client(mt5_terminal_path(), config.safety.deal_history_max_days, symbol=config.symbol)
+    client = MT5Client(mt5_terminal_path(), config.safety.deal_history_max_days, symbol=config.symbol,
+                       broker_utc_offset_hours=config.safety.broker_utc_offset_hours)     # v3.3.0: null = auto-detect
     try:
         validation = client.initialize()                                            # attach to the logged-in terminal; no credentials
     except Exception as exc:
@@ -132,6 +133,7 @@ def cli() -> int:
                                                                   "firestore_enabled": sink.enabled(), "firestore_error": sink.last_error,
                                                                   "calibration_status": snapshot.reporting.get("calibration_status"),
                                                                   "signal_go": snapshot.go_status, "target_verdict": snapshot.analysis.get("session_target", {}).get("target_verdict")})
+                telemetry.record_broker_clock(engine.broker_clock())                        # v3.3.0: offset visible in heartbeat.json
                 cycle_seconds = time.time() - t0
                 if cycle_seconds > config.poll_seconds:                                    # v1.9.0: visible when a cycle overruns the poll
                     logger.event("cycle_slow", {"cycle_seconds": round(cycle_seconds, 2), "poll_seconds": config.poll_seconds,
