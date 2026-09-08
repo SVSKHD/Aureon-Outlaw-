@@ -91,14 +91,18 @@ def test_discord_commands_answer_from_bot_files(tmp_path):
     engine.shutdown()
     state = BotState(tmp_path)
     status = dispatch(state, "!status")
-    assert isinstance(status, dict) and "WAIT / NO MANUAL ENTRY" in status["title"]
-    fields = {f["name"]: f["value"] for f in status["fields"]}                       # v3.3.0: look fields up by name
+    # v3.4.0: the title is the decision headline; manual readiness and the gate table are fields.
+    assert isinstance(status, dict) and status["title"].split(" · ")[0] in {"🟢 LONG", "🟢 SHORT", "🟠 WAIT", "🔴 NO TRADE", "⚪ CLOSED"}
+    fields = {f["name"]: f["value"] for f in status["fields"]}
     assert "COUPLED" in fields["Silver"] and "UNAVAILABLE" in fields["Fakeout assessment"]
-    assert fields["Verdict"] and fields["Blocked by"] and fields["Broker clock"]      # v3.3.0 gate table + clock
+    assert fields["Manual readiness"] == "WAIT / NO MANUAL ENTRY"
+    assert fields["Verdict"] and fields["Gates"] and fields["What flips it"] and fields["Broker clock"]
     text = dispatch(state, "!text")
     assert text.startswith("**[") and "Silver: COUPLED" in text
     det = dispatch(state, "!detected")
-    assert isinstance(det, dict) and det["title"].startswith("🔍") and len(det["fields"]) == 4
+    assert isinstance(det, dict) and det["title"].startswith("🔍") and len(det["fields"]) == 3     # compact companion
+    full = dispatch(state, "!detected full")
+    assert isinstance(full, dict) and full["title"].startswith("🔍 Detected (full)") and len(full["fields"]) == 5
     assert "XAU/XAGUSD" in dispatch(state, "!silver") and "COUPLED" in dispatch(state, "!silver")
     assert "GO tallies" in dispatch(state, "!go")
     assert "realised P/L" in dispatch(state, "!day")

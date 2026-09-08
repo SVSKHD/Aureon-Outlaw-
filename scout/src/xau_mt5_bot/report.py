@@ -126,26 +126,29 @@ def _target_line(snapshot) -> str:
 
 
 def _trace_block(snapshot) -> str:
-    """v3.3.0: the verdict, every gate that failed and what would flip it — printed every cycle."""
+    """v3.4.0: the same decision card the Discord status card shows, in plain text, every cycle."""
     trace = snapshot.analysis.get("decision_trace") or {}
     if not trace:
         return "unavailable"
-    blocked = trace.get("blocked_by") or []
-    lines = [f"Verdict: {trace.get('verdict')}",
+    lines = [str(trace.get("headline") or ""), f"Verdict: {trace.get('verdict')}",
              f"Gates: {trace.get('passed_count')}/{trace.get('gate_count')} passed"]
-    if blocked:
-        lines.append("Blocked by:")
-        lines += [f"  - {g.get('name')}: {g.get('value')}"
-                  + (f" (needs {g.get('threshold')})" if g.get("threshold") not in (None, "") else "")
-                  + (f" — {g.get('note')}" if g.get("note") else "") for g in blocked]
-    if trace.get("next"):
-        lines.append("Next: " + "; ".join(str(x) for x in trace["next"][:4]))
+    for gate in trace.get("gates") or []:
+        threshold = f" vs {gate.get('threshold')}" if gate.get("threshold") not in (None, "") else ""
+        lines.append(f"  {gate.get('icon', '?')} {gate.get('name')}: {gate.get('value')}{threshold}")
+    if trace.get("flips"):
+        lines.append("What flips it:")
+        lines += [f"  {item}" for item in trace["flips"][:3]]
     evidence = trace.get("evidence") or {}
-    for label in ("long", "short"):
-        items = evidence.get(label) or []
+    for label, key in (("FOR", "for"), ("AGAINST", "against")):
+        items = evidence.get(key) or []
         if items:
-            lines.append(f"Evidence {label.upper()} ({evidence.get(label + '_score')}): "
-                         + ", ".join(f"{i['label']} +{i['points']}" for i in items))
+            lines.append(f"Evidence {label} ({evidence.get(key + '_score', '')}): "
+                         + ", ".join(f"{i['label']} {int(i['points']):+d}" for i in items[:5]))
     lines.append(f"Silver: {evidence.get('silver', 'n/a')}")
+    levels = trace.get("levels") or {}
+    lines.append(f"Levels: price {levels.get('price')} · zone {levels.get('zone')} · SL {levels.get('stop_loss')} "
+                 f"· TP1 {levels.get('take_profit_1')}")
+    if trace.get("remaining_vetoes"):
+        lines.append("Still to clear once the zone is reached: " + ", ".join(str(x) for x in trace["remaining_vetoes"]))
     lines.append(trace.get("go_meaning", ""))
     return "\n".join(x for x in lines if x)

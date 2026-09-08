@@ -119,20 +119,74 @@ def _fields(*pairs: tuple[str, str, bool]) -> list[dict[str, Any]]:
 
 
 def blocked_by_line(s: dict[str, Any]) -> str:
-    """Every router veto currently active, in router order — so a NO-GO explains itself (v3.3.0)."""
+    """The gate that actually blocked the decision, then the vetoes still standing behind it (v3.4.0)."""
     trace = _g(s, "analysis", "decision_trace", default={}) or {}
     failed = trace.get("blocked_by") or s.get("blocked_by") or []
     if not failed:
         return "nothing — every router gate passed"
-    return "\n".join(f"• {g.get('name')} — {g.get('value')}"
-                      + (f" (needs {g.get('threshold')})" if g.get("threshold") not in (None, "") else "")
-                      for g in failed[:10])
+    lines = [f"❌ {g.get('name')} — {g.get('value')}"
+             + (f" (needs {g.get('threshold')})" if g.get("threshold") not in (None, "") else "") for g in failed[:1]]
+    rest = trace.get("remaining_vetoes") or [g.get("name") for g in failed[1:]]
+    if rest:
+        lines.append("still waiting behind it: " + ", ".join(str(x) for x in rest[:6]))
+    return "\n".join(lines)
 
 
 def next_line(s: dict[str, Any]) -> str:
     trace = _g(s, "analysis", "decision_trace", default={}) or {}
-    items = trace.get("next") or []
-    return "\n".join(f"• {item}" for item in items[:6]) or "—"
+    items = trace.get("flips") or [f"{i + 1}. {item}" for i, item in enumerate(trace.get("next") or [])]
+    return "\n".join(str(item) for item in items[:3]) or "—"
+
+
+def checklist_block(s: dict[str, Any], limit: int = 14) -> str:
+    """Every router gate, one row: ✅/❌/— · name · measured vs threshold."""
+    trace = _g(s, "analysis", "decision_trace", default={}) or {}
+    gates = trace.get("gates") or []
+    if not gates:
+        return "gate table unavailable (snapshot predates v3.4.0)"
+    rows = []
+    for gate in gates[:limit]:
+        icon = gate.get("icon") or ("✅" if gate.get("passed", True) else "❌")
+        threshold = f" vs {gate.get('threshold')}" if gate.get("threshold") not in (None, "") else ""
+        rows.append(f"{icon} {gate.get('name')} · {gate.get('value')}{threshold}")
+    return "\n".join(rows)
+
+
+def evidence_block(s: dict[str, Any]) -> tuple[str, str]:
+    trace = _g(s, "analysis", "decision_trace", default={}) or {}
+    ev = trace.get("evidence") or {}
+    def render(items: list[dict[str, Any]]) -> str:
+        return "\n".join(f"{item.get('label')} {int(item.get('points', 0)):+d}" for item in (items or [])[:6]) or "—"
+    for_text = render(ev.get("for"))
+    against_text = render(ev.get("against"))
+    if ev.get("for_score") is not None:
+        for_text = f"score {ev.get('for_score')}\n{for_text}"
+    if ev.get("against_score") is not None:
+        against_text = f"opposing score {ev.get('against_score')}\n{against_text}"
+    return for_text, against_text
+
+
+def levels_block(s: dict[str, Any]) -> str:
+    trace = _g(s, "analysis", "decision_trace", default={}) or {}
+    lv = trace.get("levels") or {}
+    plan = s.get("trade_plan") or {}
+    rows = [f"price {_f(lv.get('price') or s.get('bid'))} · spread {_f(lv.get('spread') or s.get('spread'))}",
+            f"zone {lv.get('zone') or 'none'}" + (f" · {_f(lv.get('distance_atr'), 1)} ATR away" if lv.get("distance_atr") else "")]
+    sl = lv.get("stop_loss") if lv.get("stop_loss") is not None else plan.get("stop_loss")
+    tp1 = lv.get("take_profit_1") if lv.get("take_profit_1") is not None else (plan.get("take_profits") or [None])[0]
+    rr1 = lv.get("rr_1") if lv.get("rr_1") is not None else (plan.get("actual_rr") or [None])[0]
+    rows.append(f"SL {_f(sl)} · TP1 {_f(tp1)}" + (f" ({_f(rr1)}R)" if rr1 is not None else "") if sl or tp1 else "no plan yet")
+    return "\n".join(rows)
+
+
+def _footer_text(s: dict[str, Any], trace: dict[str, Any]) -> str:
+    footer = trace.get("footer") or {}
+    remaining = footer.get("remaining_vetoes") or trace.get("remaining_vetoes") or []
+    parts = [str(footer.get("go_meaning") or trace.get("go_meaning") or "")]
+    if remaining:
+        parts.append("once the zone is reached, still to clear: " + ", ".join(str(x) for x in remaining[:5]))
+    parts.append(str(footer.get("hint") or "!why for the full gate table"))
+    return " · ".join(part for part in parts if part)[:2040]
 
 
 def fakeout_text(s: dict[str, Any]) -> str:
@@ -162,53 +216,55 @@ def next_pattern_text(s: dict[str, Any]) -> str:
             "This is what to watch next, not a prediction that it will occur.")
 
 
+def manual_plan_text(s: dict[str, Any], ready: bool) -> str:
+    """The plan a human would place by hand, with every target and its R (from the v3.2.1 manual card)."""
+    plan = s.get("trade_plan") or {}
+    if not plan:
+        return "UNAVAILABLE - no valid structural entry/SL/TP plan; do not enter."
+    targets = "\n".join(f"TP{i + 1} {_f(tp)} · {_f((plan.get('actual_rr') or [])[i]) if i < len(plan.get('actual_rr') or []) else 'n/a'}R"
+                        for i, tp in enumerate(plan.get("take_profits") or []))
+    return (f"{'READY AT SNAPSHOT' if ready else 'WATCHLIST ONLY - NOT AN ENTRY'}\n"
+            f"{plan.get('side')} entry {_f(plan.get('entry'))} · SL {_f(plan.get('stop_loss'))}\n"
+            f"SL reason: {plan.get('sl_reason', 'structural invalidation')}\n{targets or 'No valid targets'}")
+
+
 def status_card(s: dict[str, Any], tz: str) -> dict[str, Any]:
-    """Manual-readiness card: what the router decided, whether it is safe to act, what blocked it,
-    and what would flip it (manual framing from v3.2.1, gate table added in v3.3.0)."""
+    """THE decision card: headline, verdict sentence, gate checklist, what flips it, evidence, levels (v3.4.0)."""
+    trace = _g(s, "analysis", "decision_trace", default={}) or {}
     go = str(s.get("go_status", "NO-GO")); action = str(_g(s, "decision", "action", default="NO_TRADE"))
     pa = s.get("pa_side") or "NEUTRAL"; conf = s.get("confluence", 0)
-    st = s.get("structures", {}); sc = s.get("scout", {}); im = _g(s, "analysis", "intermarket", default={})
-    zone = (s.get("zones") or [None])[0]; plan = s.get("trade_plan") or {}
-    tgt = _g(s, "analysis", "session_target", default={})
-    trace = _g(s, "analysis", "decision_trace", default={}) or {}
+    sc = s.get("scout", {}); im = _g(s, "analysis", "intermarket", default={})
     clock = _g(s, "analysis", "broker_clock", default={}) or {}
-    ready = (go == "GO" and action in {"LONG", "SHORT"} and bool(plan)
-             and bool(sc.get("buy_ticket") and sc.get("sell_ticket")) and sc.get("verdict") == "CONFIRMS")
-    manual_action = f"{'BUY' if action == 'LONG' else 'SELL'} READY" if ready else "WAIT / NO MANUAL ENTRY"
-    colour = GREEN if ready else AMBER
-
-    plan_text = "UNAVAILABLE - no valid structural entry/SL/TP plan; do not enter."
-    if plan:
-        targets = "\n".join(f"TP{i + 1} {_f(tp)} · {_f((plan.get('actual_rr') or [])[i]) if i < len(plan.get('actual_rr') or []) else 'n/a'}R"
-                            for i, tp in enumerate(plan.get("take_profits") or []))
-        plan_text = (f"{'READY AT SNAPSHOT' if ready else 'WATCHLIST ONLY - NOT AN ENTRY'}\n"
-                     f"{plan.get('side')} entry {_f(plan.get('entry'))} · SL {_f(plan.get('stop_loss'))}\n"
-                     f"SL reason: {plan.get('sl_reason', 'structural invalidation')}\n{targets or 'No valid targets'}")
-    zone_text = f"{_f(zone.get('low'))}–{_f(zone.get('high'))} {zone.get('kind')}" if zone else "no zone"
-    gates = trace.get("gates") or []
-    gate_line = f"{trace.get('passed_count', 0)}/{trace.get('gate_count', len(gates))} gates passed" if gates else "gate table unavailable"
+    plan = s.get("trade_plan") or {}
+    state = str(trace.get("state") or ("READY" if action in {"LONG", "SHORT"} else "WAIT" if action == "WAIT" else "NO_TRADE"))
+    colour = {"ORDER_PLACED": GREEN, "READY": GREEN, "WAIT": AMBER, "NO_TRADE": RED, "CLOSED": GREY}.get(state, GREY)
+    headline = str(trace.get("headline") or f"{go} · {action} · {pa} {conf}/100 · {s.get('session')}")
+    for_text, against_text = evidence_block(s)
+    ready = (state == "ORDER_PLACED" or (go == "GO" and action in {"LONG", "SHORT"} and bool(plan)
+             and bool(sc.get("buy_ticket") and sc.get("sell_ticket")) and sc.get("verdict") == "CONFIRMS"))
     return {
-        "title": f"{'🟢' if ready else '🟠'} {manual_action} · {s.get('symbol', 'XAUUSD')}",
-        "description": f"{s.get('session')} · {str(s.get('timestamp', ''))[:10]} {_t(s.get('timestamp'), tz)} {tz} · {_f(s.get('bid'))}/{_f(s.get('ask'))} spread {_f(s.get('spread'))} · data {s.get('freshness')}",
+        "title": headline[:250],
+        "description": f"{_t(s.get('timestamp'), tz)} {tz} · {_f(s.get('bid'))}/{_f(s.get('ask'))} · spread {_f(s.get('spread'))} · data {s.get('freshness')}",
         "color": colour,
         "fields": _fields(
             ("Verdict", str(trace.get("verdict") or _g(s, "decision", "reason", default="")), False),
-            ("Blocked by", blocked_by_line(s), False),
-            ("Next", next_line(s), False),
-            ("Router / confirmation", f"Signal {go} · {action} · PA {pa} confluence {conf}/100 (not a probability). Manual readiness also requires a complete confirming scout pair.", False),
-            ("Structure", f"D1 {_g(st, 'D1', 'state')} · H4 {_g(st, 'H4', 'state')} · H1 {_g(st, 'H1', 'state')} · M15 {_g(st, 'M15', 'state')} · M5 {_g(st, 'M5', 'state')}", False),
-            ("Scouts", f"{'PAIR ACTIVE' if sc.get('buy_ticket') and sc.get('sell_ticket') else 'PAIR INCOMPLETE / NOT PLACED - NO CONFIRMATION'}\n{sc.get('leader') or 'none'} · BUY {_f(sc.get('buy_pnl'))} / SELL {_f(sc.get('sell_pnl'))} · {sc.get('verdict')} {sc.get('strength')}/10 · pace {sc.get('market_speed')}", True),
-            ("Silver", f"{im.get('regime', 'n/a')} r={im.get('correlation')} · SMT {im.get('smt', 'NONE')} · leading {im.get('silver_leading', 'NONE')}", True),
-            ("Entry", f"{zone_text} · {s.get('entry_state')} · trigger {'CONFIRMED' if _g(s, 'trigger', 'confirmed') else 'waiting'}", False),
-            ("Manual entry / SL / targets", plan_text, False),
+            ("Gates", checklist_block(s), False),
+            ("What flips it", next_line(s), False),
+            ("Evidence FOR", for_text, True),
+            ("Evidence AGAINST", against_text, True),
+            ("Levels", levels_block(s), False),
+            ("Scouts", f"{'PAIR ACTIVE' if sc.get('buy_ticket') and sc.get('sell_ticket') else 'PAIR INCOMPLETE / NOT PLACED - NO CONFIRMATION'}"
+                       f" · {sc.get('leader') or 'none'} {sc.get('verdict')} {sc.get('strength')}/10 · pace {sc.get('market_speed')}", True),
+            ("Silver", f"{im.get('regime', 'n/a')} r={im.get('correlation')} · SMT {im.get('smt', 'NONE')}", True),
+            ("Manual entry / SL / targets", manual_plan_text(s, ready), False),
+            ("Manual readiness", ("BUY READY" if pa == "LONG" else "SELL READY") if ready else "WAIT / NO MANUAL ENTRY", True),
+            ("Broker clock", offset_line(clock) if clock else "n/a", True),
             ("Next pattern to watch", next_pattern_text(s), False),
             ("Fakeout assessment", fakeout_text(s), False),
-            ("Validity", "Snapshot only. Recheck !status before entry; cancel on invalidation, stale data or a changed decision. TP/SL apply to this MT5 feed, not a cTrader quote.", False),
-            ("$10 target", f"{tgt.get('target_verdict', 'n/a')} · {_f(_g(s, 'analysis', 'remaining_session_minutes'), 0)} min left", True),
-            ("Broker clock", offset_line(clock) if clock else "n/a", True),
-            ("What GO means", str(trace.get("go_meaning") or "GO = this cycle's demo setup passed every router gate; it is a signal, not an order."), False),
+            ("Validity", "Snapshot only. Recheck !status before entry; cancel on invalidation, stale data or a changed decision. "
+                         "TP/SL apply to this MT5 feed, not a cTrader quote.", False),
         ),
-        "footer": {"text": f"{gate_line} · MTF {_g(s, 'analysis', 'multi_timeframe', 'label', default='n/a')} · calibration {_g(s, 'reporting', 'calibration_status', default='n/a')} · demo only"},
+        "footer": {"text": f"{trace.get('passed_count', 0)}/{trace.get('gate_count', 0)} gates · " + _footer_text(s, trace)},
     }
 
 
@@ -238,34 +294,65 @@ def _sweep_lines(s: dict[str, Any], limit: int = 6) -> list[str]:
     return [line for _, line in sorted(entries, key=lambda item: item[0])][:limit]
 
 
-def detections_card(s: dict[str, Any], tz: str, limit: int = 8) -> dict[str, Any]:
-    """What the engine currently sees: candle/chart patterns, structure events, sweeps, live zones."""
-    pats = s.get("patterns") or []
-    pat_lines = [f"{_t(p.get('timestamp'), tz)} {p.get('name') or p.get('event')}" + (f" ({p.get('timeframe')})" if p.get("timeframe") else "") for p in pats[-limit:]]
-    ev_lines = []
-    for tf in ("H4", "H1", "M15", "M5"):
-        for e in (_g(s, "structures", tf, "events", default=[]) or [])[-2:]:                    # two newest per timeframe
-            ev_lines.append(f"{tf} {e.get('event')} @ {_f(e.get('level'))} {_t(e.get('timestamp'), tz)}")
-    sweeps = _sweep_lines(s, 6)
+def structure_strip(s: dict[str, Any]) -> str:
+    """D1 ▲ H4 ▲ H1 ▼ M15 ▲ M5 ▲ — the whole higher-timeframe picture in one line."""
+    arrows = {"BULLISH": "▲", "BEARISH": "▼"}
+    return " ".join(f"{tf} {arrows.get(str(_g(s, 'structures', tf, 'state', default='')), '·')}"
+                    for tf in ("D1", "H4", "H1", "M15", "M5"))
+
+
+def _zone_lines(s: dict[str, Any], limit: int = 5) -> list[str]:
     price = float(s.get("bid") or 0) or None
     atr = _g(s, "analysis", "atr", default=None) or _g(s, "reporting", "atr", default=None)
-    zones = []
-    for z in (s.get("zones") or [])[:5]:
+    lines = []
+    for z in (s.get("zones") or [])[:limit]:
         line = f"{z.get('side')} {z.get('kind')} {_f(z.get('low'))}–{_f(z.get('high'))} · score {_f(z.get('score'), 1)} · {z.get('status')}"
         if price and atr:
             middle = (float(z.get("low", 0)) + float(z.get("high", 0))) / 2
             line += f" · {abs(price - middle) / float(atr):.1f} ATR away"
-        zones.append(line)
+        lines.append(line)
+    return lines
+
+
+def detections_card(s: dict[str, Any], tz: str, limit: int = 8, full: bool = False) -> dict[str, Any]:
+    """Compact companion to the decision card: structure strip, three newest patterns, three newest
+    sweeps on the bias side, zones with ATR distance. `full=True` (`!detected full`) shows everything."""
+    pats = s.get("patterns") or []
+    bias = s.get("pa_side")
+    if full:
+        pat_lines = [f"{_t(p.get('timestamp'), tz)} {p.get('name') or p.get('event')}"
+                     + (f" ({p.get('timeframe')})" if p.get("timeframe") else "") for p in pats[-limit:]]
+        ev_lines = [f"{tf} {e.get('event')} @ {_f(e.get('level'))} {_t(e.get('timestamp'), tz)}"
+                    for tf in ("H4", "H1", "M15", "M5")
+                    for e in (_g(s, "structures", tf, "events", default=[]) or [])[-2:]]
+        return {
+            "title": f"🔍 Detected (full) · {s.get('session')} · {_t(s.get('timestamp'), tz)}",
+            "color": PURPLE,
+            "fields": _fields(
+                ("Structure", structure_strip(s), False),
+                ("Candle / chart patterns", "\n".join(pat_lines), False),
+                ("Structure events", "\n".join(ev_lines), False),
+                ("Active sweeps", "\n".join(_sweep_lines(s, 6)), False),
+                ("Zones (best first)", "\n".join(_zone_lines(s, 5)), False),
+            ),
+            "footer": {"text": f"PA {bias or 'NEUTRAL'} {s.get('confluence')}/100 · {len(pats)} patterns · "
+                               f"{len(s.get('sweeps') or [])} sweeps · {len(s.get('zones') or [])} zones"},
+        }
+    relevant = [p for p in pats if not bias or str(p.get("name") or p.get("event") or "").upper().find("BEAR" if bias == "LONG" else "BULL") < 0]
+    pat_lines = [f"{_t(p.get('timestamp'), tz)} {p.get('name') or p.get('event')}" for p in (relevant or pats)[-3:]]
+    side_sweeps = [sw for sw in (s.get("sweeps") or [])
+                   if sw.get("active", True) and (not bias or sw.get("direction") == ("BULLISH" if bias == "LONG" else "BEARISH"))]
+    sweeps = _sweep_lines({**s, "sweeps": side_sweeps or (s.get("sweeps") or [])}, 3)
     return {
         "title": f"🔍 Detected · {s.get('session')} · {_t(s.get('timestamp'), tz)}",
         "color": PURPLE,
+        "description": structure_strip(s),
         "fields": _fields(
-            ("Candle / chart patterns", "\n".join(pat_lines), False),
-            ("Structure events", "\n".join(ev_lines), False),
-            ("Active sweeps", "\n".join(sweeps), False),
-            ("Zones (best first)", "\n".join(zones), False),
+            ("Newest patterns", "\n".join(pat_lines), False),
+            (f"Newest sweeps ({bias or 'either side'})", "\n".join(sweeps), False),
+            ("Zones", "\n".join(_zone_lines(s, 3)), False),
         ),
-        "footer": {"text": f"PA {s.get('pa_side') or 'NEUTRAL'} {s.get('confluence')}/100 · {len(pats)} patterns · {len(s.get('sweeps') or [])} sweeps · {len(s.get('zones') or [])} zones"},
+        "footer": {"text": f"PA {bias or 'NEUTRAL'} {s.get('confluence')}/100 · !detected full for everything the engine sees"},
     }
 
 
@@ -345,18 +432,31 @@ def order_card(kind: str, payload: dict[str, Any], tz: str = "UTC") -> dict[str,
         risk = f"{_f(payload.get('risk_price'))} price"
         if payload.get("risk_currency") is not None:
             risk += f" ≈ {_f(payload.get('risk_currency'))} at {payload.get('volume')} lot"
-        return {"title": titles["order"], "color": colour,
-                "description": f"#{payload.get('ticket')} · {payload.get('session')} · entry {_f(payload.get('entry'))} · {payload.get('volume')} lot",
+        # v3.4.0: same skeleton as the decision card — headline, verdict sentence, the gates that let it through.
+        passed = "\n".join([
+            f"✅ spread · {_f(payload.get('spread'))}" if payload.get("spread") is not None else "✅ spread · within limit",
+            f"✅ confluence · {payload.get('confluence')}/100",
+            f"✅ inside zone · {payload.get('zone_kind') or 'zone'} {payload.get('zone') or ''}".rstrip(),
+            f"✅ trigger · {payload.get('trigger_source')} {payload.get('trigger_reason') or ''}".rstrip(),
+            f"✅ scouts · {payload.get('scout_leader')} {payload.get('scout_verdict')} {payload.get('scout_strength')}/10",
+            f"✅ RR · {_f((payload.get('actual_rr') or [None])[0])} to TP1",
+        ])
+        management = "\n".join([
+            f"TP1 {_f((payload.get('take_profits') or [None])[0])} → partial close, SL to break-even",
+            f"TP2 {_f((payload.get('take_profits') or [None, None])[1] if len(payload.get('take_profits') or []) > 1 else None)} → partial close, SL locked at TP1",
+            "then trail behind confirmed M5 structure (ATR fallback)",
+            f"invalidation: {payload.get('invalidation') or 'n/a'}",
+        ])
+        return {"title": f"🟢 {payload.get('side')} PLACED · #{payload.get('ticket')} · {payload.get('volume')} lot",
+                "color": colour,
+                "description": f"{payload.get('session')} · entry {_f(payload.get('entry'))} · SL {_f(payload.get('stop_loss'))} · {risk}",
                 "fields": _fields(
-                    ("Stop loss", f"{_f(payload.get('stop_loss'))} ({payload.get('sl_reason')})", True),
-                    ("Take profits", tps, True),
-                    ("Risk", risk, True),
-                    ("Zone", f"{payload.get('zone_kind') or 'n/a'} {payload.get('zone') or ''}", True),
-                    ("Trigger", f"{payload.get('trigger_source')} · {payload.get('trigger_reason')}", False),
-                    ("Confluence", f"{payload.get('confluence')}/100 · scouts {payload.get('scout_verdict')} "
-                                   f"{payload.get('scout_strength')}/10 (leader {payload.get('scout_leader')})", True),
-                    ("Silver", str(payload.get("silver") or "n/a"), True),
-                    ("Invalidation", str(payload.get("invalidation") or ""), False))}
+                    ("Verdict", f"{payload.get('side')} placed at {_f(payload.get('entry'))}, SL {_f(payload.get('stop_loss'))} "
+                                f"({payload.get('sl_reason')}), targets {tps}.", False),
+                    ("Gates passed", passed, False),
+                    ("Management plan", management, False),
+                    ("Levels", f"entry {_f(payload.get('entry'))} · SL {_f(payload.get('stop_loss'))} · TP {tps}", False)),
+                "footer": {"text": f"silver {payload.get('silver') or 'n/a'} · demo only · !why for the full gate table"}}
     if kind in {"pa_partial", "pa_breakeven", "pa_breakeven_retry", "pa_tp2_lock", "pa_tp2_lock_retry", "pa_trail", "pa_close"}:
         label = payload.get("label")
         title = titles.get(kind, kind.upper())
