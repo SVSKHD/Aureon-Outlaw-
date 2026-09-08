@@ -105,6 +105,18 @@ Conservative extension points (not claimed as production-calibrated):
 
 See `EXAMPLE_REPORTS.md` for LONG, SHORT, WAIT and active-position output examples.
 
+## v3.4.0 — one decision card (Sep 8 2026)
+
+- The status card is now THE decision card: headline (emoji · state · bias · score · session · time),
+  a ≤30-word verdict sentence with the numbers, the 14-gate checklist with ✅/❌/— and measured value
+  vs threshold, "what flips it" in up to three numbered conditions, evidence FOR and AGAINST, the
+  levels involved, and a footer saying what GO means and which vetoes still stand.
+- The router stops at its first failing check, so the checklist marks exactly one ❌ and shows every
+  later gate as `not reached`.
+- Order cards reuse the same skeleton; `!detected` is now a compact companion with `!detected full`
+  for everything the engine sees.
+- 275 passing tests. See `RELEASE_NOTES_v3.4.0.md`.
+
 ## v3.3.0 — broker clock offset + a readable decision (Sep 7 2026)
 
 - **Root cause of "scouts are never placed"**: MT5 reports tick and bar times in the BROKER SERVER
@@ -135,7 +147,7 @@ See `EXAMPLE_REPORTS.md` for LONG, SHORT, WAIT and active-position output exampl
 
 - `intermarket.py`: XAU/XAG rolling correlation, relative strength and M15 SMT divergence as a capped (8-point) confluence family,
   active only while the metals are COUPLED (r ≥ 0.50). Evidence only; degrades to UNAVAILABLE without blocking a cycle.
-- `discord_bot.py` + `run_discord_bot.bat`: read-only command bot (`!status !why !clock !detected !plan !silver !scouts !positions !day !trades !go
+- `discord_bot.py` + `run_discord_bot.bat`: read-only command bot (`!status !why !clock !detected [full] !plan !silver !scouts !positions !day !trades !go
   !events !reports !heartbeat`). Needs `DISCORD_BOT_TOKEN` in `.env`, `pip install -e ".[discord]"`, Message Content Intent on.
 - 212 passing tests. See `RELEASE_NOTES_v3.1.0.md`.
 
