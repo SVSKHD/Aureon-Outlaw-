@@ -133,7 +133,7 @@ deal time to UTC before anything else looks at them.
 * Check it any time from Discord with `!clock` (system UTC, broker time, detected offset, residual
   skew, guard status), or in `data/heartbeat.json` (`broker_utc_offset_hours`).
 
-## Reading a NO-GO (v3.3.0)
+## Reading a NO-GO (v3.3.0, one card in v3.4.0)
 
 * `!why` (or `!decide`) prints every router gate for the latest cycle — PASS/FAIL, the value, the
   threshold — followed by what would flip each failed gate and the strongest evidence per side.
@@ -141,3 +141,20 @@ deal time to UTC before anything else looks at them.
   **Verdict**, **Blocked by** and **Next**.
 * GO means the cycle's demo setup passed every gate. It is a signal and a session GO tally, never a
   standing instruction to place an order.
+
+## The decision card (v3.4.0)
+
+`!status` (and the webhook, on every change or hourly) answers "go or not" in one screen:
+
+1. the headline — 🟢 placed / 🟠 waiting / 🔴 no trade / ⚪ session closed, with the bias, the score,
+   the session and the time;
+2. a one-sentence verdict with the numbers in it;
+3. the 14-gate checklist — ✅ passed, ❌ the one gate that blocked it, — for the gates the router
+   never reached;
+4. "what flips it": up to three concrete conditions;
+5. evidence for and against the bias;
+6. price, zone (with its distance in ATR), SL and TP1;
+7. what GO means, and which vetoes still stand behind the blocker.
+
+`!why` prints the same gate table as text, `!detected` is the compact market companion and
+`!detected full` shows everything the engine sees.

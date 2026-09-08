@@ -140,13 +140,18 @@ def test_scout_pair_recovers_when_clock_is_corrected(config, tmp_path):
     assert len(c.sent)==2
 
 
+def _readiness(card):
+    """v3.4.0: the title is now the decision headline, so manual readiness has its own field."""
+    return {f['name']: f['value'] for f in card['fields']}['Manual readiness']
+
+
 def test_manual_ready_requires_confirming_pair():
     s=snap(); s['go_status']='GO'; s['decision']['action']='LONG'
-    assert 'WAIT / NO MANUAL ENTRY' in status_card(s, 'UTC')['title']
+    assert _readiness(status_card(s, 'UTC')) == 'WAIT / NO MANUAL ENTRY'
     s['scout']=dict(buy_ticket=1, sell_ticket=2, verdict='CONFIRMS')
-    assert 'BUY READY' in status_card(s, 'UTC')['title']
+    assert _readiness(status_card(s, 'UTC')) == 'BUY READY'
     s['scout']['verdict']='CONTRADICTS'
-    assert 'WAIT / NO MANUAL ENTRY' in status_card(s, 'UTC')['title']
+    assert _readiness(status_card(s, 'UTC')) == 'WAIT / NO MANUAL ENTRY'
 
 
 def test_offset_normalizes_position_and_deal_times_without_mutating_broker(monkeypatch):

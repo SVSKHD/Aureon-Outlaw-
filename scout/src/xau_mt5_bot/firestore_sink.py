@@ -13,7 +13,7 @@ from .models import AnalysisSnapshot
 
 
 class FirestoreSink:
-    SCHEMA_VERSION = "3.3.0"
+    SCHEMA_VERSION = "3.4.0"
 
     def __init__(self, key_path: str, push_seconds: int = 300, series_seconds: int = 30,
                  series_max_points: int = 240) -> None:

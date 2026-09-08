@@ -5,6 +5,7 @@ import json
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from test_v18_features import _BarClient
 from test_v31_discord_bot import _SilverClient, _project
 from xau_mt5_bot.cards import (
     _sweep_lines,
+    checklist_block,
     blocked_by_line,
     detections_card,
     event_card,
@@ -23,6 +25,7 @@ from xau_mt5_bot.cards import (
     status_card,
 )
 from xau_mt5_bot.decision_router import GATE_ORDER, explain_decision, final_decision_router
+from xau_mt5_bot.models import Decision
 from xau_mt5_bot.discord_bot import HELP, BotState, dispatch, fmt_clock, fmt_why
 from xau_mt5_bot.engine import TradingEngine
 from xau_mt5_bot.history import reset_history_cache
@@ -57,92 +60,28 @@ def _input(**over) -> DecisionInput:
     return DecisionInput(**base)
 
 
-# ---- the gate table ------------------------------------------------------------------------------------
-def test_every_router_gate_is_reported_in_order():
-    value = _input()
-    trace = explain_decision(value, final_decision_router(value, datetime.now(UTC)), {})
-    assert [g["name"] for g in trace["gates"]] == list(GATE_ORDER)
-    assert trace["action"] == "LONG" and not trace["blocked_by"]
-    assert trace["passed_count"] == trace["gate_count"] == len(GATE_ORDER)
-    assert trace["verdict"].startswith("LONG authorised")
-    assert "signal" in trace["go_meaning"]
-
-
-def test_a_no_go_names_every_active_veto_and_what_would_flip_it():
-    value = _input(confluence=46, entry_state=EntryState.APPROACHING,
-                   trigger=TriggerResult(False, "NONE", reason="no confirmation yet"), rr=None,
-                   target_realism=TargetRealism.UNLIKELY)
-    decision = final_decision_router(value, datetime.now(UTC))
-    trace = explain_decision(value, decision, {"zone_text": "FVG 4396.25–4402.88", "session_target_verdict": "UNLIKELY",
-                                               "spread": 0.2, "max_spread_price": 0.6, "side_gap": 12})
-    blocked = [g["name"] for g in trace["blocked_by"]]
-    assert blocked == ["confluence", "inside zone", "trigger fresh", "RR", "target realism", "$ session feasibility"]
-    assert blocked == [name for name in GATE_ORDER if name in blocked]           # router order preserved
-    assert "9 more confluence points" in trace["next"]
-    assert "FVG 4396.25–4402.88" in " ".join(trace["next"])
-    assert trace["verdict"].startswith("NO TRADE — LONG bias 46/100; blocked by confluence")
-
-
-def test_the_clock_gate_states_the_offset_it_already_applied():
-    value = _input(account_safe=False)
-    trace = explain_decision(value, final_decision_router(value, datetime.now(UTC)),
-                             {"clock_ok": False, "residual_skew_seconds": 1500, "max_clock_skew_seconds": 600,
-                              "broker_utc_offset_hours": 3.0, "account_reason": "broker clock skew 1500s"})
-    clock = next(g for g in trace["gates"] if g["name"] == "clock")
-    assert not clock["passed"] and clock["value"] == "1500s residual" and clock["threshold"] == "≤ 600s"
-    assert "UTC+3h is applied before this check" in clock["note"]
-    assert any("PC clock" in item for item in trace["next"])
-
-
-def test_gates_after_a_missing_setup_are_reported_as_not_reached():
-    value = _input(pa_side=None, setup_valid=False, entry_state=EntryState.NOT_IN_SETUP)
-    trace = explain_decision(value, final_decision_router(value, datetime.now(UTC)), {"side_gap": 3, "min_side_gap": 8})
-    by_name = {g["name"]: g for g in trace["gates"]}
-    assert by_name["inside zone"]["value"] == "not reached" and by_name["trigger fresh"]["value"] == "not reached"
-    assert not by_name["setup exists"]["passed"]
-    assert not by_name["PA side gap"]["passed"] and by_name["PA side gap"]["value"] == 3
-
-
-def test_evidence_lists_the_three_strongest_families_per_side():
-    value = _input()
-    detail = {"long_families": {"htf": 18, "structure": 12, "liquidity": 8, "candle": 2, "momentum": 0},
-              "short_families": {"htf": 0, "structure": 4}, "long_score": 40, "short_score": 4}
-    trace = explain_decision(value, final_decision_router(value, datetime.now(UTC)),
-                             {"direction_detail": detail, "intermarket": {"status": "OK", "regime": "COUPLED",
-                                                                          "correlation": 0.93, "smt": "NONE",
-                                                                          "long_points": 3, "short_points": 0}})
-    evidence = trace["evidence"]
-    assert [item["family"] for item in evidence["long"]] == ["htf", "structure", "liquidity"]
-    assert evidence["long"][0]["label"] == "higher-timeframe trend" and evidence["long"][0]["points"] == 18
-    assert len(evidence["short"]) == 1 and evidence["long_score"] == 40
-    assert "COUPLED" in evidence["silver"] and "+3L" in evidence["silver"]
-
-
-def test_a_real_cycle_carries_the_trace_into_the_snapshot_report_and_sqlite(tmp_path):
+def test_every_snapshot_carries_the_trace_into_the_report_and_sqlite(tmp_path):
     reset_history_cache()
     cfg, logger = _project(tmp_path)
     client = _SilverClient()
     engine = TradingEngine(client, cfg, logger)
-    snapshot = engine.run_cycle(client.tick.time)
+    first = engine.run_cycle(client.tick.time)
+    second = engine.run_cycle(client.tick.time + timedelta(seconds=5))
     engine.shutdown()
 
-    trace = snapshot.analysis["decision_trace"]
-    assert [g["name"] for g in trace["gates"]] == list(GATE_ORDER)
-    assert trace["action"] == snapshot.decision.action.value
-    assert snapshot.analysis["blocked_by"] == trace["blocked_by"]
-    assert snapshot.analysis["broker_clock"]["broker_utc_offset_hours"] == 0.0
+    for snapshot in (first, second):
+        trace = snapshot.analysis["decision_trace"]                       # present in EVERY snapshot
+        assert [g["name"] for g in trace["gates"]] == list(GATE_ORDER)
+        assert trace["action"] == snapshot.decision.action.value
+        assert trace["headline"] and trace["verdict"]
+        assert [g["status"] for g in trace["gates"]].count("fail") <= 1
+        assert snapshot.analysis["blocked_by"] == trace["blocked_by"]
+        assert trace["levels"]["price"] is not None
 
-    report = format_report(snapshot, "UTC")
-    assert "DECISION TRACE" in report and trace["verdict"] in report
-    if trace["blocked_by"]:
-        assert "Blocked by:" in report
+    report = format_report(second, "UTC")
+    assert "DECISION TRACE" in report and second.analysis["decision_trace"]["verdict"] in report
+    assert "Levels:" in report
 
-    stored = json.loads(logger._connect().execute(
-        "SELECT payload_json FROM analysis_snapshots ORDER BY id DESC LIMIT 1").fetchone()[0])
-    assert stored["analysis"]["decision_trace"]["verdict"] == trace["verdict"]
-
-
-# ---- !why / !clock -------------------------------------------------------------------------------------
 def test_why_and_clock_commands_answer_from_the_snapshot(tmp_path):
     reset_history_cache()
     cfg, logger = _project(tmp_path)
@@ -155,7 +94,7 @@ def test_why_and_clock_commands_answer_from_the_snapshot(tmp_path):
     why = dispatch(state, "!why")
     assert why == fmt_why(state) == dispatch(state, "!decide")            # !decide is an alias
     assert "gates passed" in why and "```" in why
-    assert all(name in why for name in ("data fresh", "clock", "RR", "day lock"))
+    assert all(name in why for name in ("data fresh", "clock + account", "RR", "risk locks"))
     assert "Silver:" in why
 
     clock = dispatch(state, "!clock")
@@ -164,10 +103,8 @@ def test_why_and_clock_commands_answer_from_the_snapshot(tmp_path):
     assert "Detected offset: UTC+0h" in clock and "Residual skew:" in clock
     assert "orders allowed" in clock
 
-    assert "`!why`" in HELP and "`!clock`" in HELP
+    assert "`!why`" in HELP and "`!clock`" in HELP and "!detected full" in HELP
     assert "not implemented by design" in dispatch(state, "!close")        # still no order commands
-
-
 def test_why_and_clock_are_graceful_before_the_bot_has_run(tmp_path):
     shutil.copy(ROOT / "config.yaml", tmp_path / "config.yaml")
     state = BotState(tmp_path)
@@ -185,29 +122,71 @@ def test_clock_command_falls_back_to_the_heartbeat(tmp_path):
     assert "UTC+3h" in text and "Demo-Server" in text
 
 
-# ---- status card ---------------------------------------------------------------------------------------
-def test_status_card_shows_verdict_blocked_by_and_next():
+def _decision_snapshot(**over) -> dict:
     snapshot = {"go_status": "NO-GO", "decision": {"action": "WAIT", "reason": "no fresh confirmation"},
-                "confluence": 46, "pa_side": "LONG", "session": "ASIA", "bid": 4400.0, "ask": 4400.2, "spread": 0.2,
-                "analysis": {"decision_trace": {"verdict": "WAIT — LONG bias 46/100; blocked by confluence (46)",
-                                                "blocked_by": [{"name": "confluence", "value": 46, "threshold": 55},
-                                                               {"name": "trigger fresh", "value": "waiting", "threshold": ""}],
-                                                "next": ["9 more confluence points", "an M1 sweep+BOS"],
-                                                "passed_count": 15, "gate_count": 17,
-                                                "gates": [{"name": "clock", "passed": True}],
-                                                "go_meaning": "GO = signal, not an order."},
-                             "broker_clock": {"broker_utc_offset_hours": 3.0, "broker_clock_source": "auto",
-                                              "residual_skew_seconds": 0.4}}}
-    card = status_card(snapshot, "UTC")
+                "confluence": 58, "pa_side": "LONG", "session": "ASIA", "symbol": "XAUUSD",
+                "bid": 4400.0, "ask": 4400.2, "spread": 0.2, "freshness": "LIVE",
+                "timestamp": "2026-09-07T01:00:00+00:00",
+                "trade_plan": {"side": "LONG", "entry": 4401.0, "stop_loss": 4396.0, "sl_reason": "below the FVG",
+                               "take_profits": [4406.0, 4411.0], "actual_rr": [1.0, 2.0]},
+                "zones": [{"side": "LONG", "kind": "FVG", "low": 4396.25, "high": 4402.88, "score": 7, "status": "fresh"}],
+                "scout": {}, "structures": {}, "patterns": [], "sweeps": [],
+                "analysis": {"decision_trace": {
+                    "headline": "🟠 WAIT · LONG bias 58/100 · inside zone, trigger · ASIA 06:30",
+                    "state": "WAIT", "verdict": "LONG bias 58/100: blocked by inside zone (APPROACHING vs inside FVG 4396.25–4402.88); price 0.8 ATR from FVG 4396.25–4402.88.",
+                    "gates": [{"name": "spread", "status": "pass", "icon": "✅", "value": "0.20", "threshold": "≤ 0.60", "passed": True},
+                              {"name": "inside zone", "status": "fail", "icon": "❌", "value": "APPROACHING · 0.8 ATR away",
+                               "threshold": "inside FVG 4396.25–4402.88", "passed": False},
+                              {"name": "trigger", "status": "skip", "icon": "—", "value": "not reached", "threshold": "", "passed": True}],
+                    "first_blocking": "inside zone",
+                    "blocked_by": [{"name": "inside zone", "value": "APPROACHING · 0.8 ATR away", "threshold": "inside FVG 4396.25–4402.88"},
+                                   {"name": "trigger", "value": "waiting", "threshold": "fresh M1/M5 confirmation"}],
+                    "remaining_vetoes": ["trigger"],
+                    "flips": ["1. inside zone: price back inside FVG 4396.25–4402.88", "2. trigger: an M1 sweep+BOS"],
+                    "passed_count": 5, "gate_count": 14,
+                    "evidence": {"for": [{"family": "htf", "label": "higher-timeframe trend", "points": 18}],
+                                 "against": [{"family": "range", "label": "daily range exhausted", "points": -10}],
+                                 "for_score": 58, "against_score": 20, "silver": "XAG COUPLED r=0.9"},
+                    "levels": {"price": 4400.0, "zone": "FVG 4396.25–4402.88", "zone_kind": "FVG", "stop_loss": 4396.0,
+                               "take_profit_1": 4406.0, "rr_1": 1.0, "distance_atr": 0.8, "spread": 0.2},
+                    "go_meaning": "GO = signal, not an order.",
+                    "footer": {"go_meaning": "GO = signal, not an order.", "remaining_vetoes": ["trigger"],
+                               "hint": "!why for the full gate table"}},
+                    "broker_clock": {"broker_utc_offset_hours": 3.0, "broker_clock_source": "auto", "residual_skew_seconds": 0.4}}}
+    snapshot.update(over)
+    return snapshot
+
+
+def test_decision_card_renders_headline_verdict_checklist_flips_evidence_and_levels():
+    card = status_card(_decision_snapshot(), "UTC")
     fields = {f["name"]: f["value"] for f in card["fields"]}
-    assert fields["Verdict"].startswith("WAIT — LONG bias 46/100")
-    assert "confluence — 46 (needs 55)" in fields["Blocked by"] and "trigger fresh" in fields["Blocked by"]
-    assert "9 more confluence points" in fields["Next"]
-    assert fields["Broker clock"] == "UTC+3h (auto) · residual 0s"
-    assert "signal" in fields["What GO means"]
-    assert "15/17 gates passed" in card["footer"]["text"]
+    assert card["title"].startswith("🟠 WAIT · LONG bias 58/100")
+    assert card["color"] == 0xEF9F27                                              # amber: setup alive
+    assert fields["Verdict"].startswith("LONG bias 58/100: blocked by inside zone")
+    assert "✅ spread · 0.20 vs ≤ 0.60" in fields["Gates"]
+    assert "❌ inside zone · APPROACHING · 0.8 ATR away" in fields["Gates"]
+    assert "— trigger · not reached" in fields["Gates"]
+    assert fields["What flips it"].startswith("1. inside zone: price back inside FVG")
+    assert "higher-timeframe trend +18" in fields["Evidence FOR"] and "score 58" in fields["Evidence FOR"]
+    assert "daily range exhausted -10" in fields["Evidence AGAINST"]
+    assert "price 4400.00" in fields["Levels"] and "0.8 ATR away" in fields["Levels"]
+    assert "SL 4396.00 · TP1 4406.00 (1.00R)" in fields["Levels"]
+    assert "5/14 gates" in card["footer"]["text"]
+    assert "still to clear: trigger" in card["footer"]["text"]
+    assert "!why" in card["footer"]["text"]
 
 
+def test_decision_card_colours_follow_the_state():
+    assert status_card(_decision_snapshot(), "UTC")["color"] == 0xEF9F27           # WAIT
+    no_trade = _decision_snapshot()
+    no_trade["analysis"]["decision_trace"]["state"] = "NO_TRADE"
+    assert status_card(no_trade, "UTC")["color"] == 0xD85A30                        # red
+    closed = _decision_snapshot()
+    closed["analysis"]["decision_trace"]["state"] = "CLOSED"
+    assert status_card(closed, "UTC")["color"] == 0x8A8A8A                          # grey
+    placed = _decision_snapshot()
+    placed["analysis"]["decision_trace"]["state"] = "ORDER_PLACED"
+    assert status_card(placed, "UTC")["color"] == 0x1D9E75                          # green
 def test_blocked_by_says_so_when_nothing_is_blocking():
     assert "nothing" in blocked_by_line({"analysis": {"decision_trace": {"blocked_by": []}}})
     assert next_line({}) == "—"
@@ -288,23 +267,25 @@ def test_scouts_adopted_card_reports_the_restart():
     assert "BUY #1" in fields["Tickets"] and "SELL #2" in fields["Tickets"]
 
 
-# ---- order cards ---------------------------------------------------------------------------------------
-def test_order_card_carries_the_whole_trade():
+def test_order_card_reuses_the_decision_skeleton_with_every_target():
     payload = {"ticket": 501, "side": "LONG", "session": "LONDON", "entry": 4400.5, "stop_loss": 4396.0,
-               "sl_reason": "below the FVG", "take_profits": [4405.0, 4410.0], "actual_rr": [1.0, 2.11],
+               "sl_reason": "below the FVG", "take_profits": [4405.0, 4410.0, 4415.0], "actual_rr": [1.0, 2.11, 3.2],
                "volume": 0.02, "risk_price": 4.5, "risk_currency": 9.0, "zone_kind": "FVG", "zone": "4398.00–4401.00",
-               "trigger_reason": "M1 sweep + BOS", "trigger_source": "M1", "confluence": 72,
+               "trigger_reason": "M1 sweep + BOS", "trigger_source": "M1", "confluence": 72, "spread": 0.21,
                "scout_verdict": "CONFIRMS", "scout_leader": "BUY", "scout_strength": 6,
                "silver": "COUPLED r=0.93 · SMT NONE", "invalidation": "M5 close below 4396"}
     card = order_card("order", payload)
     fields = {f["name"]: f["value"] for f in card["fields"]}
-    assert card["title"] == "📥 ORDER PLACED · LONG" and "#501" in card["description"]
-    assert fields["Take profits"] == "4405.00 (1.00R) / 4410.00 (2.11R)"
-    assert "9.00 at 0.02 lot" in fields["Risk"]
-    assert "FVG 4398.00–4401.00" == fields["Zone"]
-    assert "M1 sweep + BOS" in fields["Trigger"]
-    assert "72/100" in fields["Confluence"] and "CONFIRMS 6/10" in fields["Confluence"]
-    assert "COUPLED" in fields["Silver"]
+    assert card["title"] == "🟢 LONG PLACED · #501 · 0.02 lot" and card["color"] == 0x1D9E75
+    assert "entry 4400.50" in card["description"] and "9.00 at 0.02 lot" in card["description"]
+    assert "4405.00 (1.00R)" in fields["Verdict"] and "4415.00 (3.20R)" in fields["Verdict"]
+    assert "✅ confluence · 72/100" in fields["Gates passed"]
+    assert "✅ trigger · M1 M1 sweep + BOS" in fields["Gates passed"]
+    assert "✅ RR · 1.00 to TP1" in fields["Gates passed"]
+    assert "TP1 4405.00 → partial close, SL to break-even" in fields["Management plan"]
+    assert "SL locked at TP1" in fields["Management plan"] and "invalidation: M5 close below 4396" in fields["Management plan"]
+    assert "COUPLED" in card["footer"]["text"]
+    assert event_card("order", payload)["title"] == card["title"]
 
 
 @pytest.mark.parametrize("kind", ["pa_partial", "pa_breakeven", "pa_tp2_lock", "pa_trail", "pa_close"])
@@ -340,39 +321,41 @@ def _sweep(level_type: str, price: float, age: int, direction: str = "BULLISH") 
             "direction": direction, "active": True}
 
 
-def test_detected_card_dedupes_collapses_round_levels_and_caps_at_six():
+def test_detected_card_is_compact_and_full_mode_shows_everything():
     snapshot = {"session": "ASIA", "timestamp": "2026-09-07T01:00:00+00:00", "bid": 4410.0, "ask": 4410.2,
+                "pa_side": "LONG", "confluence": 61,
+                "structures": {"D1": {"state": "BULLISH"}, "H4": {"state": "BULLISH"}, "H1": {"state": "BEARISH"},
+                               "M15": {"state": "BULLISH"}, "M5": {"state": "BULLISH"}},
                 "sweeps": [_sweep("ROUND_1", 4407.0, 1), _sweep("ROUND_1", 4408.0, 2), _sweep("ROUND_1", 4409.0, 3),
                            _sweep("ROUND_1", 4409.0, 9),                       # duplicate level_type+price
-                           _sweep("PDH", 4420.0, 4), _sweep("PDL", 4390.0, 5), _sweep("ASIA_HIGH", 4415.0, 6),
-                           _sweep("ASIA_LOW", 4405.0, 7), _sweep("EQUAL_HIGHS", 4418.0, 8),
+                           _sweep("PDH", 4420.0, 4), _sweep("PDL", 4390.0, 5, "BEARISH"),
+                           _sweep("ASIA_HIGH", 4415.0, 6), _sweep("EQUAL_HIGHS", 4418.0, 8),
                            _sweep("SWING_HIGH", 4419.0, 10)],
                 "zones": [{"side": "LONG", "kind": "FVG", "low": 4400.0, "high": 4402.0, "score": 7, "status": "fresh"}],
-                "analysis": {"atr": 2.0}, "patterns": [], "structures": {}}
+                "analysis": {"atr": 2.0},
+                "patterns": [{"name": f"Bullish Pin Bar {i}", "timestamp": "2026-09-07T01:00:00+00:00"} for i in range(6)]}
+
+    compact = detections_card(snapshot, "UTC")
+    fields = {f["name"]: f["value"] for f in compact["fields"]}
+    assert compact["description"] == "D1 ▲ H4 ▲ H1 ▼ M15 ▲ M5 ▲"
+    assert len(fields["Newest patterns"].split("\n")) == 3
+    assert len(fields["Newest sweeps (LONG)"].split("\n")) == 3
+    assert "BEARISH" not in fields["Newest sweeps (LONG)"] and "PDL" not in fields["Newest sweeps (LONG)"]
+    assert "4.5 ATR away" in fields["Zones"]
+    assert "!detected full" in compact["footer"]["text"]
+
     lines = _sweep_lines(snapshot, 6)
-    assert len(lines) == 6
-    assert lines[0] == "ROUND_1 ×3 (4407–4409)"                                  # newest group first (ages 1-3), collapsed
+    assert len(lines) == 6 and lines[0] == "ROUND_1 ×3 (4407–4409)"                # deduped and collapsed
     assert sum(1 for line in lines if "ROUND_1" in line) == 1
-    assert lines[1].startswith("▲ PDH") and "4 bars" in lines[1]                 # then the rest, oldest last
-    assert "SWING_HIGH" not in " ".join(lines)                                   # the 10-bar sweep falls off the six
 
-    card = detections_card(snapshot, "UTC")
-    fields = {f["name"]: f["value"] for f in card["fields"]}
-    assert "ROUND_1 ×3" in fields["Active sweeps"]
-    assert "4.5 ATR away" in fields["Zones (best first)"]                        # 4410 bid vs 4401 mid over ATR 2.0
-
-
-def test_detected_card_keeps_two_structure_events_per_timeframe():
+def test_full_detected_card_keeps_two_structure_events_per_timeframe():
     events = [{"event": f"Bullish BOS {i}", "level": 4400 + i, "timestamp": "2026-09-07T01:00:00+00:00"} for i in range(5)]
     snapshot = {"session": "ASIA", "timestamp": "2026-09-07T01:00:00+00:00", "sweeps": [], "zones": [], "patterns": [],
                 "structures": {tf: {"events": events} for tf in ("H4", "H1", "M15", "M5")}}
-    card = detections_card(snapshot, "UTC")
+    card = detections_card(snapshot, "UTC", full=True)
     lines = next(f["value"] for f in card["fields"] if f["name"] == "Structure events").split("\n")
     assert len(lines) == 8                                                       # 2 per timeframe × 4 timeframes
     assert lines[0].startswith("H4 Bullish BOS 3") and lines[1].startswith("H4 Bullish BOS 4")
-
-
-# ---- the live evidence, end to end ---------------------------------------------------------------------
 def test_a_utc_plus_three_broker_no_longer_blocks_the_scouts_in_a_full_cycle(tmp_path):
     """The reported failure, reproduced: UTC+3 server, Monday Asia session, scouts must be placed."""
     reset_history_cache()
@@ -392,3 +375,91 @@ def test_a_utc_plus_three_broker_no_longer_blocks_the_scouts_in_a_full_cycle(tmp
     opened = [json.loads(r[0]) for r in logger._connect().execute(
         "SELECT payload_json FROM events WHERE event_type='scout_session_open'").fetchall()]
     assert opened and opened[0]["buy_ticket"] and opened[0]["sell_ticket"] and opened[0]["failed_attempts"] == 0
+
+
+# ---- v3.4.0 acceptance: the four checks the decision card has to survive ------------------------------
+def test_decision_trace_is_present_in_every_snapshot(tmp_path):
+    """Every cycle — cold start, warm cycle, and the one written to SQLite — carries a full trace."""
+    reset_history_cache()
+    cfg, logger = _project(tmp_path)
+    client = _SilverClient()
+    engine = TradingEngine(client, cfg, logger)
+    snapshots = [engine.run_cycle(client.tick.time + timedelta(seconds=5 * i)) for i in range(3)]
+    engine.shutdown()
+
+    required = {"headline", "verdict", "gates", "flips", "evidence", "levels", "footer", "go_meaning",
+                "first_blocking", "passed_count", "gate_count", "state"}
+    for snapshot in snapshots:
+        trace = snapshot.analysis.get("decision_trace")
+        assert trace and required.issubset(trace), sorted(required.difference(trace or {}))
+        assert len(trace["gates"]) == len(GATE_ORDER)
+
+    rows = logger._connect().execute("SELECT payload_json FROM analysis_snapshots ORDER BY id").fetchall()
+    assert len(rows) == 3
+    for row in rows:
+        assert json.loads(row[0])["analysis"]["decision_trace"]["headline"]
+
+
+def test_exactly_one_first_blocking_gate_is_marked():
+    """Several gates would fail, but the router stops at the first — and so does the checklist."""
+    value = _input(confluence=40, entry_state=EntryState.ABOVE,
+                   trigger=TriggerResult(False, "NONE", reason="none"), rr=0.2,
+                   target_realism=TargetRealism.UNLIKELY, spread_state=SpreadState.ABNORMAL)
+    trace = explain_decision(value, final_decision_router(value, datetime.now(UTC)),
+                             {"spread": 0.9, "max_spread_price": 0.6, "session": "LONDON", "remaining_minutes": 60})
+    statuses = [g["status"] for g in trace["gates"]]
+    assert statuses.count("fail") == 1
+    assert trace["first_blocking"] == "spread" == trace["gates"][statuses.index("fail")]["name"]
+    assert statuses[statuses.index("fail") + 1:] == ["skip"] * (len(statuses) - statuses.index("fail") - 1)
+    assert all(g["icon"] == "❌" for g in trace["gates"] if g["status"] == "fail")
+
+    card_gates = checklist_block({"analysis": {"decision_trace": trace}})
+    assert card_gates.count("❌") == 1
+
+
+def test_verdict_sentence_contains_the_score_and_the_blocking_reason():
+    value = _input(confluence=49, entry_state=EntryState.APPROACHING)
+    trace = explain_decision(value, final_decision_router(value, datetime.now(UTC)),
+                             {"zone_text": "FVG 4396.25–4402.88", "zone_distance_atr": 0.8,
+                              "session": "LONDON", "remaining_minutes": 60})
+    verdict = trace["verdict"]
+    assert "49/100" in verdict                                   # the score
+    assert "confluence" in verdict and "55" in verdict           # the blocking gate and its threshold
+    assert "FVG 4396.25–4402.88" in verdict                      # where price is relative to the zone
+    assert len(verdict.split()) <= 30
+    assert "49/100" in trace["headline"]
+
+
+def test_a_placed_order_produces_the_green_card_with_all_take_profits(tmp_path):
+    reset_history_cache()
+    cfg, logger = _project(tmp_path)
+    client = _SilverClient()
+    engine = TradingEngine(client, cfg, logger)
+    snapshot = engine.run_cycle(client.tick.time)
+
+    plan = SimpleNamespace(side=Side.LONG, entry=4400.5, stop_loss=4396.0, sl_reason="below the FVG",
+                           take_profits=[4405.0, 4410.0, 4415.0], actual_rr=[1.0, 2.11, 3.2], volume=0.02,
+                           requested_entry=4400.5, target_realism=TargetRealism.REALISTIC,
+                           invalidation="M5 close below 4396")
+    zone = SimpleNamespace(kind="FVG", low=4398.0, high=4401.0)
+    result = SimpleNamespace(ticket=501, retcode=10009, message="done", success=True)
+    payload = engine._order_payload(result, plan, snapshot, zone, snapshot.trigger, "setup-1",
+                                    snapshot.analysis.get("intermarket"))
+    engine.shutdown()
+
+    card = order_card("order", payload)
+    fields = {f["name"]: f["value"] for f in card["fields"]}
+    assert card["color"] == 0x1D9E75 and card["title"] == "🟢 LONG PLACED · #501 · 0.02 lot"
+    for tp, rr in zip(plan.take_profits, plan.actual_rr):
+        assert f"{tp:.2f} ({rr:.2f}R)" in fields["Verdict"]
+    assert "SL 4396.00" in card["description"]
+    assert fields["Management plan"].count("TP") >= 2
+
+    trace = explain_decision(
+        DecisionInput(Side.LONG, True, EntryState.CONFIRMED, snapshot.trigger, snapshot.scout, Freshness.LIVE,
+                      SpreadState.NORMAL, True, 1.0, 1.0, TargetRealism.REALISTIC, 72, 55, "setup-1", 8, True),
+        Decision(Action.LONG, "authorised", datetime.now(UTC)),
+        {"order": payload, "session": "LONDON", "remaining_minutes": 60})
+    assert trace["state"] == "ORDER_PLACED"
+    assert trace["headline"] == "🟢 LONG PLACED · #501 · 0.02 lot · LONDON"
+    assert "4400.50" in trace["verdict"] and "4396.00" in trace["verdict"]

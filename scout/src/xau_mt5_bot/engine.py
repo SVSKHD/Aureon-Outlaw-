@@ -718,9 +718,13 @@ class TradingEngine:
                                                            detail=direction_detail)                             # 17. current-cycle inputs
         scout = self.scouts.snapshot(pa_side)
         if scout.verdict == ScoutVerdict.CONFIRMS:
-            confluence = min(100, confluence + min(5, scout.strength // 2))
+            bonus = min(5, scout.strength // 2)
+            confluence = min(100, confluence + bonus)
+            direction_detail["scout_adjustment"] = {"verdict": scout.verdict.value, "points": bonus}
         elif scout.verdict == ScoutVerdict.CONTRADICTS:
-            confluence = max(0, confluence - min(10, scout.strength))
+            penalty = min(10, scout.strength)
+            confluence = max(0, confluence - penalty)
+            direction_detail["scout_adjustment"] = {"verdict": scout.verdict.value, "points": -penalty}
         selected = select_entry_zone(zones, pa_side, middle, now, atr) if pa_side else None
         setup_id = f"{pa_side.value}|{selected.kind}|{selected.low:.2f}-{selected.high:.2f}|{selected.valid_from.isoformat()}" if selected and pa_side else None
         if setup_id != self.active_setup_id:                                         # item 1: trigger belongs to one setup only
@@ -874,7 +878,9 @@ class TradingEngine:
             result = execute_pa_trade(self.client, self.config, decision, plan, self.logger.event)            # 9-13. sizing, order_check, retry, verify
             self.logger.order("PA", result, {"decision": decision, "plan": plan, "result": result, "setup_id": setup_id})
             if result.success:
-                self.logger.event("order", self._order_payload(result, plan, snapshot, selected, trigger, setup_id, intermarket))   # v3.3.0: the card the trade log was missing
+                order_payload = self._order_payload(result, plan, snapshot, selected, trigger, setup_id, intermarket)
+                self._last_order_payload = {**order_payload, "cycle": now.isoformat()}                  # v3.4.0: the decision card goes green
+                self.logger.event("order", order_payload)   # v3.3.0: the card the trade log was missing
                 from dataclasses import asdict
                 for p in self.client.positions(self.config.symbol, self.config.magic.pa):
                     if str(int(p.ticket)) not in self.positions.tracked:
@@ -889,6 +895,18 @@ class TradingEngine:
                                  tdate=self.sessions.broker_trading_date(now).isoformat())
         snapshot.active_positions = self.positions.status_reports(tick.bid, tick.ask)
         selected_text = (f"{selected.kind} {selected.low:.2f}–{selected.high:.2f}" if selected else "no zone")
+        zone_distance_atr = None
+        if selected is not None and atr > 0:
+            gap_to_zone = max(selected.low - middle, middle - selected.high, 0.0)
+            zone_distance_atr = round(gap_to_zone / atr, 2)
+        try:
+            account = self.client.account_state()
+            account_state_flags = {"is_demo": account.is_demo, "is_hedging": account.is_hedging}
+        except Exception:
+            account_state_flags = {}
+        placed_order = getattr(self, "_last_order_payload", None) or {}
+        if placed_order.get("cycle") != now.isoformat():
+            placed_order = {}
         trace_context = {
             "clock_ok": self.clock_ok, "residual_skew_seconds": self.clock_skew,
             "max_clock_skew_seconds": self.config.safety.max_clock_skew_seconds,
@@ -903,6 +921,17 @@ class TradingEngine:
             "position_open": any(p.get("kind") == "PA" for p in snapshot.active_positions) if snapshot.active_positions else bool(
                 self.client.positions(self.config.symbol, self.config.magic.pa)),
             "direction_detail": direction_detail, "intermarket": intermarket,
+            "m1_age_seconds": round(m1_age, 1), "max_m1_age_seconds": self.config.safety.max_m1_age_seconds,
+            "slow_velocity": self.config.scout_analysis.slow_velocity_price_per_min,
+            "session_target_move": self.config.session_target.target_price_move,
+            "is_demo": account_state_flags.get("is_demo"), "is_hedging": account_state_flags.get("is_hedging"),
+            "long_score": direction_detail.get("long_score"), "short_score": direction_detail.get("short_score"),
+            "zone_kind": getattr(selected, "kind", None), "zone_distance_atr": zone_distance_atr,
+            "price": round(middle, 2), "atr": round(atr, 3),
+            "plan": {"stop_loss": round(plan.stop_loss, 2), "take_profits": [round(tp, 2) for tp in plan.take_profits],
+                     "actual_rr": [round(r, 2) for r in (plan.actual_rr or [])]} if plan is not None else {},
+            "time_text": now.astimezone(ZoneInfo(self.config.display_timezone)).strftime("%H:%M"),
+            "order": placed_order,
         }
         trace = explain_decision(router_input, snapshot.decision, trace_context)                                    # v3.3.0
         snapshot.analysis["decision_trace"] = trace
@@ -1204,30 +1233,36 @@ class TradingEngine:
         long_score = sum(min(caps[key], max(0, value)) for key, value in long_families.items())
         short_score = sum(min(caps[key], max(0, value)) for key, value in short_families.items())
         # penalties: counter-trend vs H4/D1, exhausted daily range
+        penalties: dict[str, list[dict[str, Any]]] = {"long": [], "short": []}
         htf_bias = sum(1 if structures[t].state == StructureState.BULLISH else -1 if structures[t].state == StructureState.BEARISH else 0 for t in ("D1", "H4") if t in structures)
-        if htf_bias < 0: long_score -= 10
-        if htf_bias > 0: short_score -= 10
-        if daily_atr > 0 and today_range / daily_atr >= 0.85: long_score -= 10; short_score -= 10
+        if htf_bias < 0: long_score -= 10; penalties["long"].append({"name": "counter-trend vs D1/H4", "points": -10})
+        if htf_bias > 0: short_score -= 10; penalties["short"].append({"name": "counter-trend vs D1/H4", "points": -10})
+        if daily_atr > 0 and today_range / daily_atr >= 0.85:
+            long_score -= 10; short_score -= 10
+            for key in ("long", "short"): penalties[key].append({"name": "daily range exhausted", "points": -10})
         # 17. nearby opposing level penalty: strong S/R within 1.5 ATR against the trade
         for zone in [z for z in zones if z.status.lower() not in invalid_states]:
             if zone.kind not in {"RESISTANCE", "SUPPORT"} or zone.score < 6: continue
-            if zone.kind == "RESISTANCE" and 0 < zone.low - price <= 1.5 * atr: long_score -= 10; break
+            if zone.kind == "RESISTANCE" and 0 < zone.low - price <= 1.5 * atr:
+                long_score -= 10; penalties["long"].append({"name": "resistance within 1.5 ATR", "points": -10}); break
         for zone in [z for z in zones if z.status.lower() not in invalid_states]:
             if zone.kind not in {"RESISTANCE", "SUPPORT"} or zone.score < 6: continue
-            if zone.kind == "SUPPORT" and 0 < price - zone.high <= 1.5 * atr: short_score -= 10; break
+            if zone.kind == "SUPPORT" and 0 < price - zone.high <= 1.5 * atr:
+                short_score -= 10; penalties["short"].append({"name": "support within 1.5 ATR", "points": -10}); break
         # 18. premium/discount + VWAP as location/momentum context
+        long_extras: list[dict[str, Any]] = []; short_extras: list[dict[str, Any]] = []
         if pd_info and pd_info.get("pct") is not None:
-            if pd_info["pct"] < 0.5: long_score += 5
-            else: short_score += 5
-        if vwap_info and vwap_info.get("relation") == "above": long_score += 3
-        if vwap_info and vwap_info.get("relation") == "below": short_score += 3
+            if pd_info["pct"] < 0.5: long_score += 5; long_extras.append({"name": "discount location", "points": 5})
+            else: short_score += 5; short_extras.append({"name": "premium location", "points": 5})
+        if vwap_info and vwap_info.get("relation") == "above": long_score += 3; long_extras.append({"name": "above VWAP", "points": 3})
+        if vwap_info and vwap_info.get("relation") == "below": short_score += 3; short_extras.append({"name": "below VWAP", "points": 3})
         long_score, short_score = max(0, min(100, long_score)), max(0, min(100, short_score))
         if detail is not None:
             detail.update({
                 "long_score": long_score, "short_score": short_score, "gap": abs(long_score - short_score), "min_gap": 8,
                 "long_families": {k: min(caps[k], max(0, v)) for k, v in long_families.items()},
                 "short_families": {k: min(caps[k], max(0, v)) for k, v in short_families.items()},
-                "caps": caps,
+                "long_extras": long_extras, "short_extras": short_extras, "penalties": penalties, "caps": caps,
             })
         if abs(long_score - short_score) < 8:
             return None, max(long_score, short_score)

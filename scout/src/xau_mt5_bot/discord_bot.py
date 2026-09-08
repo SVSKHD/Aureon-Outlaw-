@@ -31,7 +31,7 @@ import yaml
 from .cards import detections_card, status_card
 
 HELP = (
-    "`!why` (`!decide`) full gate table: verdict, every gate, what would flip it · `!clock` broker time offset and clock guard\n"
+    "`!why` (`!decide`) full gate table: verdict, every gate, what flips it · `!clock` broker time offset and clock guard\n""`!detected full` everything the engine sees (the plain `!detected` card is the compact companion)\n"
     "`!status` GO/NO-GO card · `!detected` patterns/structure/sweeps/zones card · `!text` old status block · `!plan` entry/SL/TP/RR · `!silver` XAU/XAG correlation + SMT · `!scouts` session pair\n"
     "`!positions` open PA trades · `!day` realised P/L and locks · `!trades [n]` last closed trades · `!go` session GO tallies\n"
     "`!events [n]` last audit events · `!reports [n]` session/weekly reports · `!heartbeat` process health · `!help`\n"
@@ -328,23 +328,27 @@ def fmt_why(state: BotState) -> str:
     if not trace:
         return (f"This snapshot predates v3.3.0, so there is no gate table. Router said: "
                 f"{_get(s, 'decision', 'action')} — {_get(s, 'decision', 'reason')}")
-    lines = [f"**[{s.get('go_status')}] {trace.get('verdict')}**",
-             f"{state.local(s.get('timestamp'))} · {s.get('session')} · {trace.get('passed_count')}/{trace.get('gate_count')} gates passed",
+    lines = [f"**{trace.get('headline')}**",
+             f"{trace.get('verdict')}",
+             f"{state.local(s.get('timestamp'))} · {trace.get('passed_count')}/{trace.get('gate_count')} gates passed",
              "```"]
     for gate in trace.get("gates") or []:
-        mark = "PASS" if gate.get("passed") else "FAIL"
+        icon = gate.get("icon") or ("✅" if gate.get("passed", True) else "❌")
         threshold = f" (need {gate['threshold']})" if gate.get("threshold") not in (None, "") else ""
-        lines.append(f"{mark:4} {str(gate.get('name'))[:22]:22} {str(gate.get('value'))[:28]:28}{threshold}")
+        lines.append(f"{icon} {str(gate.get('name'))[:20]:20} {str(gate.get('value'))[:30]:30}{threshold}")
     lines.append("```")
-    if trace.get("next"):
-        lines.append("**What would flip it**\n" + "\n".join(f"• {item}" for item in trace["next"][:6]))
+    if trace.get("flips"):
+        lines.append("**What flips it**\n" + "\n".join(str(item) for item in trace["flips"][:3]))
     evidence = trace.get("evidence") or {}
-    for label in ("long", "short"):
-        items = evidence.get(label) or []
+    for label, key in (("FOR", "for"), ("AGAINST", "against")):
+        items = evidence.get(key) or []
         if items:
-            lines.append(f"{label.upper()} evidence ({evidence.get(label + '_score')}): "
-                         + ", ".join(f"{i['label']} +{i['points']}" for i in items))
+            lines.append(f"{label} ({evidence.get(key + '_score', '')}): "
+                         + ", ".join(f"{i['label']} {int(i['points']):+d}" for i in items[:5]))
     lines.append(f"Silver: {evidence.get('silver', 'n/a')}")
+    remaining = trace.get("remaining_vetoes") or []
+    if remaining:
+        lines.append("Still to clear once the zone is reached: " + ", ".join(str(x) for x in remaining))
     lines.append(trace.get("go_meaning", ""))
     return "\n".join(x for x in lines if x)
 
@@ -405,7 +409,8 @@ def dispatch(state: BotState, text: str, prefix: str = "!") -> str | dict[str, A
             return status_card(snap, str(state.tz)) if snap else fmt_status(state)   # embed card (v3.2.0)
         if cmd in {"detected", "patterns", "seen"}:
             snap = state.latest_snapshot()
-            return detections_card(snap, str(state.tz)) if snap else "No snapshot yet."
+            full = bool(args) and args[0].lower() in {"full", "all", "everything"}      # v3.4.0: !detected full
+            return detections_card(snap, str(state.tz), full=full) if snap else "No snapshot yet."
         if cmd in {"why", "decide", "explain"}: return fmt_why(state)
         if cmd in {"clock", "time", "offset"}: return fmt_clock(state)
         if cmd == "text": return fmt_status(state)
